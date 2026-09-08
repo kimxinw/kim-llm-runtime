@@ -76,6 +76,10 @@ struct RunEvidence final {
     std::uint64_t model_forward_batches{0};
     std::uint64_t batched_attention_submissions{0};
     std::uint64_t batched_attention_lanes{0};
+    std::uint64_t automatic_promotion_attempts{0};
+    std::uint64_t automatic_promotion_successes{0};
+    std::uint64_t automatic_promotion_skips{0};
+    std::uint64_t automatic_promotion_failures{0};
     std::uint64_t prefill_tokens{0};
     std::uint64_t decode_tokens{0};
     std::uint32_t accepted{0};
@@ -563,6 +567,18 @@ void destroyContext(SuiteContext& context) noexcept
         - before.batched_attention_submissions;
     result.batched_attention_lanes = after.batched_attention_lanes
         - before.batched_attention_lanes;
+    result.automatic_promotion_attempts =
+        after.automatic_promotion_attempts
+        - before.automatic_promotion_attempts;
+    result.automatic_promotion_successes =
+        after.automatic_promotion_successes
+        - before.automatic_promotion_successes;
+    result.automatic_promotion_skips =
+        after.automatic_promotion_skips
+        - before.automatic_promotion_skips;
+    result.automatic_promotion_failures =
+        after.automatic_promotion_failures
+        - before.automatic_promotion_failures;
     result.resources_reclaimed = scheduler_state.activeCount() == 0
         && scheduler_state.reserved_kv_tokens == 0
         && after.request_count == 0
@@ -802,6 +818,14 @@ void writeCase(std::ostream& output, CaseEvidence const& value)
             << run.batched_attention_submissions
             << ",\"batched_attention_lanes\":"
             << run.batched_attention_lanes
+            << ",\"automatic_promotion_attempts\":"
+            << run.automatic_promotion_attempts
+            << ",\"automatic_promotion_successes\":"
+            << run.automatic_promotion_successes
+            << ",\"automatic_promotion_skips\":"
+            << run.automatic_promotion_skips
+            << ",\"automatic_promotion_failures\":"
+            << run.automatic_promotion_failures
             << ",\"average_attention_batch_size\":"
             << (run.batched_attention_submissions == 0 ? 0.0
                 : static_cast<double>(run.batched_attention_lanes)

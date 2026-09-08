@@ -64,6 +64,13 @@ namespace {
     return {EngineKvError::InternalError};
 }
 
+[[nodiscard]] CudaStatus completeSubmission(
+    CudaSubmission& submission) noexcept
+{
+    CudaStatus const submitted = submission.submissionStatus();
+    return submitted.ok() ? submission.wait() : submitted;
+}
+
 struct EngineBackendState final {
     EngineKvBackendKind kind{EngineKvBackendKind::Heterogeneous};
     EngineKvConfig config{};
@@ -74,6 +81,11 @@ struct EngineBackendState final {
     std::uint64_t active_transactions{0};
     std::atomic<std::uint64_t> batched_attention_submissions{0};
     std::atomic<std::uint64_t> batched_attention_lanes{0};
+    std::uint64_t automatic_promotion_attempts{0};
+    std::uint64_t automatic_promotion_successes{0};
+    std::uint64_t automatic_promotion_skips{0};
+    std::uint64_t automatic_promotion_failures{0};
+    bool healthy{true};
     mutable std::mutex mutex{};
 
     EngineBackendState(
@@ -161,6 +173,88 @@ struct EngineBackendState final {
         return heterogeneous != nullptr
             ? heterogeneous->snapshot().token_reservation_count
             : fixed->snapshot().token_reservation_count;
+    }
+
+    // Called with mutex held after the token and committed_lengths are both
+    // published. Promotion is deliberately best-effort: any failure keeps the
+    // already-valid Micro mapping and must not turn a committed token into an
+    // apparent generation failure.
+    void promoteCompletedRun(
+        RequestId request_id,
+        std::uint32_t committed_tokens,
+        EngineStream stream)
+    {
+        if (heterogeneous == nullptr
+            || config.promotion_policy != EngineKvPromotionPolicy::Eager
+            || committed_tokens == 0
+            || committed_tokens % kExtentPageTokenCapacity != 0) {
+            return;
+        }
+
+        ++automatic_promotion_attempts;
+        std::uint32_t const logical_token_begin =
+            committed_tokens - kExtentPageTokenCapacity;
+        PromotionPrepareResult const prepared =
+            heterogeneous->preparePromotion(
+                request_id, logical_token_begin
+            );
+        if (!prepared.ok()) {
+            if (prepared.error == KvCacheError::PromotionNotEligible) {
+                ++automatic_promotion_skips;
+            } else {
+                ++automatic_promotion_failures;
+                if (prepared.error != KvCacheError::ResourceExhausted) {
+                    healthy = false;
+                }
+            }
+            return;
+        }
+
+        PageLeaseAcquireResult lease =
+            heterogeneous->acquirePromotionIoLease(
+                prepared.promotion_id
+            );
+        if (!lease.ok()) {
+            KvCacheError const rollback =
+                heterogeneous->rollbackPromotion(prepared.promotion_id);
+            ++automatic_promotion_failures;
+            if (rollback != KvCacheError::None) {
+                healthy = false;
+            }
+            return;
+        }
+
+        CudaSubmission submission = storage.promoteAsync(prepared, stream);
+        CudaStatus const copied = completeSubmission(submission);
+        KvCacheError const lease_error =
+            heterogeneous->releasePageLease(lease.lease_id);
+        if (lease_error != KvCacheError::None) {
+            static_cast<void>(heterogeneous->rollbackPromotion(
+                prepared.promotion_id
+            ));
+            ++automatic_promotion_failures;
+            healthy = false;
+            return;
+        }
+        if (!copied.ok()) {
+            KvCacheError const rollback =
+                heterogeneous->rollbackPromotion(prepared.promotion_id);
+            ++automatic_promotion_failures;
+            if (rollback != KvCacheError::None
+                && rollback != KvCacheError::PromotionNotFound) {
+                healthy = false;
+            }
+            return;
+        }
+
+        KvCacheError const committed =
+            heterogeneous->commitPromotion(prepared.promotion_id);
+        if (committed == KvCacheError::None) {
+            ++automatic_promotion_successes;
+        } else {
+            ++automatic_promotion_failures;
+            healthy = false;
+        }
     }
 };
 
@@ -258,7 +352,7 @@ public:
         }
     }
 
-    [[nodiscard]] EngineKvStatus commit(EngineStream) override
+    [[nodiscard]] EngineKvStatus commit(EngineStream stream) override
     {
         CudaStatus const completion = io_->finish();
         if (!completion.ok()) {
@@ -280,6 +374,7 @@ public:
         ++length->second;
         --owner_->active_transactions;
         resolved_ = true;
+        owner_->promoteCompletedRun(request_id_, length->second, stream);
         return {};
     }
 
@@ -342,7 +437,8 @@ public:
         RequestId request_id) override
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        if (!state_->config.valid() || !state_->storage.status().ok()) {
+        if (!state_->healthy || !state_->config.valid()
+            || !state_->storage.status().ok()) {
             return {EngineKvError::InvalidState};
         }
         KvCacheError const created = state_->create(request_id);
@@ -357,6 +453,9 @@ public:
         RequestId child_request_id) override
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->healthy) {
+            return {EngineKvError::InvalidState};
+        }
         auto const source = state_->committed_lengths.find(source_request_id);
         if (source == state_->committed_lengths.end()) {
             return {EngineKvError::RequestNotFound};
@@ -388,6 +487,10 @@ public:
     {
         TokenReserveResult result;
         std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->healthy) {
+            result.status = {EngineKvError::InvalidState};
+            return result;
+        }
         auto const length = state_->committed_lengths.find(
             request.request_id
         );
@@ -501,6 +604,14 @@ public:
             state_->batched_attention_lanes.load(std::memory_order_relaxed);
         CudaStorageSnapshot const storage = state_->storage.snapshot();
         result.storage_reserved_bytes = storage.totalReservedBytes();
+        result.automatic_promotion_attempts =
+            state_->automatic_promotion_attempts;
+        result.automatic_promotion_successes =
+            state_->automatic_promotion_successes;
+        result.automatic_promotion_skips =
+            state_->automatic_promotion_skips;
+        result.automatic_promotion_failures =
+            state_->automatic_promotion_failures;
         if (state_->heterogeneous != nullptr) {
             KvCacheManagerSnapshot const metadata =
                 state_->heterogeneous->snapshot();
@@ -537,7 +648,8 @@ public:
     [[nodiscard]] bool checkInvariants() const override
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        return state_->config.valid()
+        return state_->healthy
+            && state_->config.valid()
             && state_->storage.status().ok()
             && state_->metadataInvariants()
             && state_->active_transactions == state_->reservationCount();

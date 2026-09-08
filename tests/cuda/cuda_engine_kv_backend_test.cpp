@@ -91,6 +91,7 @@ enum class FaultMode {
     None,
     Submission,
     Completion,
+    PromotionSubmission,
 };
 
 std::vector<float> referenceOutput(
@@ -230,6 +231,17 @@ bool runToken(
         return false;
     }
 
+    if (fault == FaultMode::PromotionSubmission) {
+        expect(
+            (history.size() + 1) % kExtentPageTokenCapacity == 0,
+            "promotion fault is injected at an Extent boundary"
+        );
+        expect(injectCudaEngineFailureOnce(
+            backend, CudaFailurePoint::Submission),
+            "inject promotion submission failure"
+        );
+    }
+
     expect(reserved.transaction.commit().ok(), "commit engine token");
     std::vector<KvScalar> host_output(4);
     expect(cudaMemcpy(
@@ -253,6 +265,167 @@ bool runToken(
         "commit clears active transaction"
     );
     return true;
+}
+
+void testAutomaticPromotion()
+{
+    EngineKvConfig const config{KvLayout{2, 1, 2}, 2, 4096};
+    std::unique_ptr<EngineKvBackend> backend =
+        createHeterogeneousCudaEngineKvBackend(config, 16, 2);
+    expect(backend != nullptr, "create automatic promotion backend");
+    expect(backend->createRequest(80).ok(), "create promotion request");
+
+    DeviceBuffers device;
+    std::vector<int> history;
+    for (int token = 0; token < 64; ++token) {
+        expect(runToken(*backend, 80, history, token, device),
+            "commit automatic promotion source token");
+    }
+
+    EngineKvBackendSnapshot promoted = backend->snapshot();
+    expect(promoted.committed_token_count == 64,
+        "promotion preserves committed token count");
+    expect(promoted.allocated_primary_pages == 0
+            && promoted.allocated_secondary_pages == 1,
+        "eight Micro pages are atomically replaced by one Extent");
+    expect(promoted.automatic_promotion_attempts == 1
+            && promoted.automatic_promotion_successes == 1
+            && promoted.automatic_promotion_skips == 0
+            && promoted.automatic_promotion_failures == 0,
+        "snapshot reports successful automatic promotion");
+
+    expect(runToken(*backend, 80, history, 64, device),
+        "attention and append continue across Extent plus Micro tail");
+    promoted = backend->snapshot();
+    expect(promoted.allocated_primary_pages == 1
+            && promoted.allocated_secondary_pages == 1,
+        "post-promotion append creates a Micro tail");
+    expect(backend->releaseRequest(80).ok(),
+        "release automatically promoted request");
+    EngineKvBackendSnapshot const empty = backend->snapshot();
+    expect(empty.allocated_primary_pages == 0
+            && empty.allocated_secondary_pages == 0,
+        "automatic promotion pages return to both pools");
+    expect(backend->checkInvariants(),
+        "automatic promotion preserves backend invariants");
+}
+
+void testAutomaticPromotionFailureIsBestEffort()
+{
+    EngineKvConfig const config{KvLayout{2, 1, 2}, 2, 4096};
+    std::unique_ptr<EngineKvBackend> backend =
+        createHeterogeneousCudaEngineKvBackend(config, 16, 1);
+    expect(backend != nullptr, "create promotion failure backend");
+    expect(backend->createRequest(90).ok(),
+        "create promotion failure request");
+
+    DeviceBuffers device;
+    std::vector<int> history;
+    for (int token = 0; token < 63; ++token) {
+        expect(runToken(*backend, 90, history, token, device),
+            "commit promotion failure source token");
+    }
+    expect(runToken(
+        *backend,
+        90,
+        history,
+        63,
+        device,
+        FaultMode::PromotionSubmission
+    ), "promotion submission failure does not fail token commit");
+
+    EngineKvBackendSnapshot const failed = backend->snapshot();
+    expect(failed.committed_token_count == 64,
+        "failed promotion retains the committed token");
+    expect(failed.allocated_primary_pages == 8
+            && failed.allocated_secondary_pages == 0,
+        "failed promotion rolls back to the original Micro mapping");
+    expect(failed.automatic_promotion_attempts == 1
+            && failed.automatic_promotion_successes == 0
+            && failed.automatic_promotion_failures == 1,
+        "snapshot reports the best-effort promotion failure");
+    expect(backend->checkInvariants(),
+        "failed automatic promotion preserves invariants");
+    expect(backend->releaseRequest(90).ok(),
+        "release request after automatic promotion failure");
+    EngineKvBackendSnapshot const empty = backend->snapshot();
+    expect(empty.allocated_primary_pages == 0
+            && empty.allocated_secondary_pages == 0,
+        "failed promotion leaves no page leak");
+}
+
+void testAutomaticPromotionCanBeDisabled()
+{
+    EngineKvConfig const config{
+        KvLayout{2, 1, 2},
+        2,
+        4096,
+        EngineKvPromotionPolicy::Disabled,
+    };
+    std::unique_ptr<EngineKvBackend> backend =
+        createHeterogeneousCudaEngineKvBackend(config, 8, 1);
+    expect(backend != nullptr, "create promotion-disabled backend");
+    expect(backend->createRequest(100).ok(),
+        "create promotion-disabled request");
+
+    DeviceBuffers device;
+    std::vector<int> history;
+    for (int token = 0; token < 64; ++token) {
+        expect(runToken(*backend, 100, history, token, device),
+            "commit promotion-disabled source token");
+    }
+    EngineKvBackendSnapshot const snapshot = backend->snapshot();
+    expect(snapshot.allocated_primary_pages == 8
+            && snapshot.allocated_secondary_pages == 0,
+        "disabled policy retains the Micro layout");
+    expect(snapshot.automatic_promotion_attempts == 0,
+        "disabled policy performs no promotion attempt");
+    expect(backend->releaseRequest(100).ok(),
+        "release promotion-disabled request");
+    expect(backend->checkInvariants(),
+        "disabled policy preserves invariants");
+}
+
+void testAutomaticPromotionExtentExhaustion()
+{
+    EngineKvConfig const config{KvLayout{2, 1, 2}, 2, 4096};
+    std::unique_ptr<EngineKvBackend> backend =
+        createHeterogeneousCudaEngineKvBackend(config, 16, 1);
+    expect(backend != nullptr, "create extent exhaustion backend");
+    expect(backend->createRequest(110).ok(), "create extent owner");
+    expect(backend->createRequest(111).ok(), "create extent contender");
+
+    DeviceBuffers device;
+    std::vector<int> owner_history;
+    std::vector<int> contender_history;
+    for (int token = 0; token < 64; ++token) {
+        expect(runToken(*backend, 110, owner_history, token, device),
+            "commit extent owner token");
+    }
+    for (int token = 0; token < 64; ++token) {
+        expect(runToken(*backend, 111, contender_history, token, device),
+            "Extent OOM does not fail contender token");
+    }
+
+    EngineKvBackendSnapshot const exhausted = backend->snapshot();
+    expect(exhausted.committed_token_count == 128,
+        "Extent OOM preserves both committed sequences");
+    expect(exhausted.allocated_primary_pages == 8
+            && exhausted.allocated_secondary_pages == 1,
+        "Extent OOM retains contender Micro pages");
+    expect(exhausted.automatic_promotion_attempts == 2
+            && exhausted.automatic_promotion_successes == 1
+            && exhausted.automatic_promotion_failures == 1,
+        "snapshot distinguishes successful and exhausted promotions");
+    expect(backend->checkInvariants(),
+        "Extent OOM preserves backend invariants");
+    expect(backend->releaseRequest(111).ok(),
+        "release Extent contender");
+    expect(backend->releaseRequest(110).ok(), "release Extent owner");
+    EngineKvBackendSnapshot const empty = backend->snapshot();
+    expect(empty.allocated_primary_pages == 0
+            && empty.allocated_secondary_pages == 0,
+        "Extent exhaustion test reclaims both pools");
 }
 
 void testBackend(
@@ -612,6 +785,10 @@ int main()
         testBackend(EngineKvBackendKind::Fixed, page_tokens);
     }
     testExtentPagedAttention();
+    testAutomaticPromotion();
+    testAutomaticPromotionFailureIsBestEffort();
+    testAutomaticPromotionCanBeDisabled();
+    testAutomaticPromotionExtentExhaustion();
     testBatchedAttentionFailureIsolation(
         EngineKvBackendKind::Heterogeneous
     );

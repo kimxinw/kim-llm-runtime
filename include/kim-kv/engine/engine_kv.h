@@ -22,6 +22,21 @@ enum class EngineKvBackendKind : std::uint8_t {
     Fixed,
 };
 
+// Promotion is a storage-layout optimization and must never change token
+// commit semantics. Eager promotes each newly completed aligned 64-token run;
+// Disabled is retained for controlled A/B measurements.
+enum class EngineKvPromotionPolicy : std::uint8_t {
+    Disabled,
+    Eager,
+};
+
+[[nodiscard]] constexpr bool isKnownEngineKvPromotionPolicy(
+    EngineKvPromotionPolicy policy) noexcept
+{
+    return policy == EngineKvPromotionPolicy::Disabled
+        || policy == EngineKvPromotionPolicy::Eager;
+}
+
 enum class EngineKvError : std::uint8_t {
     None,
     InvalidArgument,
@@ -85,13 +100,17 @@ struct EngineKvConfig final {
     KvLayout kv_layout{};
     std::uint32_t query_head_count{0};
     std::size_t attention_workspace_bytes{0};
+    EngineKvPromotionPolicy promotion_policy{
+        EngineKvPromotionPolicy::Eager
+    };
 
     [[nodiscard]] constexpr bool valid() const noexcept
     {
         return kv_layout.valid()
             && query_head_count >= kv_layout.kv_head_count
             && query_head_count % kv_layout.kv_head_count == 0
-            && attention_workspace_bytes != 0;
+            && attention_workspace_bytes != 0
+            && isKnownEngineKvPromotionPolicy(promotion_policy);
     }
 };
 
@@ -388,6 +407,12 @@ struct EngineKvBackendSnapshot final {
     std::uint64_t failed_primary_allocations{0};
     std::uint64_t failed_secondary_allocations{0};
     std::uint64_t storage_reserved_bytes{0};
+    // Eager promotion is best-effort after a token commit. A failure means
+    // the committed Micro layout was retained; it does not fail generation.
+    std::uint64_t automatic_promotion_attempts{0};
+    std::uint64_t automatic_promotion_successes{0};
+    std::uint64_t automatic_promotion_skips{0};
+    std::uint64_t automatic_promotion_failures{0};
 };
 
 // ModelRunner/Scheduler 只依赖该接口。Fixed 与 Heterogeneous 后端必须保持

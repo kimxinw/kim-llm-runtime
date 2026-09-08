@@ -161,6 +161,12 @@ void testConfigurationAndDescriptorContract()
         "query heads must be an integer multiple of KV heads"
     );
 
+    EngineKvConfig invalid_promotion = gqa_config;
+    invalid_promotion.promotion_policy =
+        static_cast<EngineKvPromotionPolicy>(255);
+    expect(!invalid_promotion.valid(),
+        "unknown promotion policies must be rejected");
+
     DeviceBlockDescriptor descriptor{
         3,
         11,

@@ -691,6 +691,11 @@ void testGenerationRuntime()
             && snapshot.active_transaction_count == 0
             && snapshot.committed_token_count == 0,
             "CUDA generation releases request, transaction, and committed KV");
+        if (workload.input_length >= kExtentPageTokenCapacity) {
+            expect(snapshot.automatic_promotion_successes >= 2
+                    && snapshot.automatic_promotion_failures == 0,
+                "long generation automatically exercises Extent pages");
+        }
         expect(backend->checkInvariants(),
             "CUDA generation preserves backend invariants");
     }

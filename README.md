@@ -23,7 +23,8 @@ flowchart LR
 ### 1. 异构 Paged KV Cache
 
 - 8-Token Micro Page 与 64-Token Extent Page 协同管理短、长序列
-- 支持 Prefix Fork、Partial-Tail COW、Promotion 和 Page Lease
+- 支持 Prefix Fork、Partial-Tail COW、Page Lease，以及 Generation 路径自动 Promotion
+- 每个新完成的 64-Token 对齐区间自动将 8 个 Micro Page 合并为 1 个 Extent Page；失败保留原布局
 - Token 级事务保证全部 Decoder Layer 成功后提交，失败自动回滚
 - 提供 Fixed-8/16/32/64 基线，用于公平比较碎片率和数据路径开销
 
@@ -46,7 +47,7 @@ flowchart LR
 | 项目 | 结果 |
 |---|---:|
 | CPU / CUDA Release | `13/13 PASS` / `20/20 PASS` |
-| CPU ASan/UBSan | `12/12 PASS` |
+| CPU ASan/UBSan | `13/13 PASS` |
 | CUDA Sanitizer | memcheck、racecheck、initcheck 均为 `0 errors` |
 | 模型正确性 | Hidden、Logits、Top-10 通过数值门禁 |
 | 端到端生成 | 8 个 Prompt 的完整 Token 与 Transformers FP16 一致 |
@@ -94,4 +95,4 @@ scripts/run_e5_end_to_end.sh
 - Ragged Batched Paged Attention 已实现
 - KV Write 与事务提交仍按 Batch Lane 处理，Attention Scores 与 Output 仍为两个 Kernel
 - Chunk 内按因果 Wave 逐 Token 推进，尚未实现融合的多 Token Prefill Attention
-- Generation 路径尚未自动触发 Micro → Extent Promotion
+- 自动 Promotion 当前在 Token Commit 边界同步执行；失败后不做后台重试
