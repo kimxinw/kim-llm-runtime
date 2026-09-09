@@ -112,6 +112,14 @@ void launchWriteLayerToken(
     cudaStream_t stream
 );
 
+void launchWriteLayerTokenBatch(
+    ::kimkvcache::DeviceLayerKvWriteBatchItem const* items,
+    std::uint32_t item_count,
+    std::uint32_t max_copy_token_count,
+    DeviceLayout layout,
+    cudaStream_t stream
+);
+
 void launchPagedDecodeAttention(
     ::kimkvcache::DeviceBlockDescriptor const* descriptors,
     std::uint32_t descriptor_count,

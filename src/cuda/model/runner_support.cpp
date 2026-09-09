@@ -103,6 +103,8 @@ bool makeWorkspaceLayout(
         static_cast<std::size_t>(config.attention_head_count)
         * config.max_position_embeddings * sizeof(float);
     std::size_t token_id_bytes = sizeof(std::uint32_t);
+    std::size_t kv_write_batch_item_bytes =
+        sizeof(DeviceLayerKvWriteBatchItem);
     std::size_t attention_batch_item_bytes =
         sizeof(DevicePagedDecodeBatchItem);
     bool const scaled = multiply(hidden_bytes, max_batch_size, hidden_bytes)
@@ -111,6 +113,11 @@ bool makeWorkspaceLayout(
         && multiply(logits_bytes, max_batch_size, logits_bytes)
         && multiply(score_bytes, max_batch_size, score_bytes)
         && multiply(token_id_bytes, max_batch_size, token_id_bytes)
+        && multiply(
+            kv_write_batch_item_bytes,
+            max_batch_size,
+            kv_write_batch_item_bytes
+        )
         && multiply(
             attention_batch_item_bytes,
             max_batch_size,
@@ -132,6 +139,11 @@ bool makeWorkspaceLayout(
         && addRegion(logits_bytes, cursor, layout.logits)
         && addRegion(token_id_bytes, cursor, layout.greedy_token)
         && addRegion(score_bytes, cursor, layout.attention_scores)
+        && addRegion(
+            kv_write_batch_item_bytes,
+            cursor,
+            layout.kv_write_batch_items
+        )
         && addRegion(
             attention_batch_item_bytes,
             cursor,

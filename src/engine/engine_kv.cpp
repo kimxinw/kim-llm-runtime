@@ -14,6 +14,22 @@ namespace {
 } // namespace
 
 TokenTransactionBackend* TokenTransactionBackend::batchBackend(
+    LayerKvWriteBatchItem const& item) noexcept
+{
+    return item.transaction != nullptr
+        ? item.transaction->backend_.get()
+        : nullptr;
+}
+
+EngineStream TokenTransactionBackend::batchStream(
+    LayerKvWriteBatchItem const& item) noexcept
+{
+    return item.transaction != nullptr
+        ? item.transaction->stream_
+        : nullptr;
+}
+
+TokenTransactionBackend* TokenTransactionBackend::batchBackend(
     PagedDecodeBatchItem const& item) noexcept
 {
     return item.transaction != nullptr
@@ -27,6 +43,22 @@ EngineStream TokenTransactionBackend::batchStream(
     return item.transaction != nullptr
         ? item.transaction->stream_
         : nullptr;
+}
+
+void TokenTransactionBackend::writeLayerBatch(LayerKvWriteBatch& batch)
+{
+    for (std::size_t index = 0; index < batch.item_count; ++index) {
+        LayerKvWriteBatchItem& item = batch.items[index];
+        if (!item.status.ok()) {
+            continue;
+        }
+        TokenTransactionBackend* const backend = batchBackend(item);
+        if (backend == nullptr) {
+            item.status = status(EngineKvError::InvalidState);
+            continue;
+        }
+        item.status = backend->writeLayer(item.write, batchStream(item));
+    }
 }
 
 void TokenTransactionBackend::attendLayerBatch(PagedDecodeBatch& batch)
@@ -250,6 +282,63 @@ void TokenTransaction::resetMovedFrom() noexcept
     next_layer_ = 0;
     phase_ = TokenTransactionPhase::Empty;
     stream_ = nullptr;
+}
+
+void writeLayerBatch(LayerKvWriteBatch& batch)
+{
+    if (batch.items == nullptr || batch.item_count == 0) {
+        return;
+    }
+
+    bool const scratch_valid = batch.host_items != nullptr
+        && batch.device_items != nullptr
+        && batch.item_capacity >= batch.item_count;
+    TokenTransactionBackend* dispatcher = nullptr;
+
+    for (std::size_t index = 0; index < batch.item_count; ++index) {
+        LayerKvWriteBatchItem& item = batch.items[index];
+        item.status = {};
+        item.dispatched = false;
+        TokenTransaction* const transaction = item.transaction;
+        if (!scratch_valid) {
+            item.status = status(EngineKvError::InvalidArgument);
+        } else if (transaction == nullptr || !transaction->active()) {
+            item.status = status(EngineKvError::InvalidState);
+        } else if (transaction->phase_
+                != TokenTransactionPhase::AwaitingLayerWrite
+            || item.write.layer != transaction->next_layer_) {
+            item.status = status(EngineKvError::LayerOutOfOrder);
+        } else if (item.write.device_key == nullptr
+            || item.write.device_value == nullptr) {
+            item.status = status(EngineKvError::InvalidArgument);
+        } else {
+            item.dispatched = true;
+            if (dispatcher == nullptr) {
+                dispatcher = transaction->backend_.get();
+            }
+        }
+    }
+
+    if (dispatcher == nullptr) {
+        return;
+    }
+    dispatcher->writeLayerBatch(batch);
+
+    for (std::size_t index = 0; index < batch.item_count; ++index) {
+        LayerKvWriteBatchItem& item = batch.items[index];
+        TokenTransaction* const transaction = item.transaction;
+        if (!item.dispatched || transaction == nullptr
+            || transaction->phase_
+                != TokenTransactionPhase::AwaitingLayerWrite
+            || item.write.layer != transaction->next_layer_) {
+            continue;
+        }
+        if (!item.status.ok()) {
+            transaction->phase_ = TokenTransactionPhase::Failed;
+            continue;
+        }
+        transaction->phase_ = TokenTransactionPhase::AwaitingLayerAttention;
+    }
 }
 
 void attendLayerBatch(PagedDecodeBatch& batch)

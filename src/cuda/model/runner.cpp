@@ -425,9 +425,11 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
     std::vector<std::uint32_t> token_ids;
     std::vector<std::uint32_t> positions;
     std::vector<TokenTransaction> transactions;
+    std::vector<LayerKvWriteBatchItem> kv_write_batch_items;
     std::vector<PagedDecodeBatchItem> attention_batch_items;
     try {
         result.steps.resize(batch.size());
+        kv_write_batch_items.resize(batch.size());
         attention_batch_items.resize(batch.size());
         active_indices.reserve(batch.size());
         token_ids.reserve(batch.size());
@@ -543,6 +545,10 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
         impl_->workspace<std::uint32_t>(offsets.greedy_token);
     float* const attention_scores =
         impl_->workspace<float>(offsets.attention_scores);
+    DeviceLayerKvWriteBatchItem* const device_kv_write_batch_items =
+        impl_->workspace<DeviceLayerKvWriteBatchItem>(
+            offsets.kv_write_batch_items
+        );
     DevicePagedDecodeBatchItem* const device_attention_batch_items =
         impl_->workspace<DevicePagedDecodeBatchItem>(
             offsets.attention_batch_items
@@ -635,20 +641,59 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
             return result;
         }
 
-        for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
-            if (!active[lane]) {
-                continue;
-            }
-            EngineKvStatus const write = transactions[lane].writeLayer(
-                LayerKvWrite{
-                    layer,
-                    key + static_cast<std::size_t>(lane) * kv_size,
-                    value + static_cast<std::size_t>(lane) * kv_size,
+        auto kvWrite = [&](std::uint32_t lane) {
+            return LayerKvWrite{
+                layer,
+                key + static_cast<std::size_t>(lane) * kv_size,
+                value + static_cast<std::size_t>(lane) * kv_size,
+            };
+        };
+        std::size_t const write_lane_count = static_cast<std::size_t>(
+            std::count(active.begin(), active.end(), true)
+        );
+        if (write_lane_count == 1) {
+            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+                if (!active[lane]) {
+                    continue;
                 }
-            );
-            if (!write.ok()) {
+                EngineKvStatus const write =
+                    transactions[lane].writeLayer(kvWrite(lane));
+                if (!write.ok()) {
+                    result.steps[active_indices[lane]] = {
+                        false, 0,
+                        kvFailure(write, "single-lane layer kv write").detail,
+                    };
+                    active[lane] = false;
+                }
+            }
+        } else {
+            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+                kv_write_batch_items[lane] = {};
+                if (active[lane]) {
+                    kv_write_batch_items[lane].transaction =
+                        &transactions[lane];
+                    kv_write_batch_items[lane].write = kvWrite(lane);
+                }
+            }
+            LayerKvWriteBatch write_batch{
+                kv_write_batch_items.data(),
+                batch_size,
+                impl_->host_kv_write_batch_items.data(),
+                device_kv_write_batch_items,
+                impl_->host_kv_write_batch_items.size(),
+            };
+            writeLayerBatch(write_batch);
+            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+                if (!active[lane] || kv_write_batch_items[lane].status.ok()) {
+                    continue;
+                }
                 result.steps[active_indices[lane]] = {
-                    false, 0, kvFailure(write, "write batched layer kv").detail,
+                    false,
+                    0,
+                    kvFailure(
+                        kv_write_batch_items[lane].status,
+                        "batched layer kv write"
+                    ).detail,
                 };
                 active[lane] = false;
             }

@@ -98,6 +98,90 @@ __global__ void writeLayerTokenKernel(
         + dimension];
 }
 
+__global__ void writeLayerTokenBatchKernel(
+    ::kimkvcache::DeviceLayerKvWriteBatchItem const* items,
+    DeviceLayout layout,
+    std::size_t max_element_count)
+{
+    std::size_t const index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= max_element_count) {
+        return;
+    }
+    ::kimkvcache::DeviceLayerKvWriteBatchItem const item = items[blockIdx.y];
+    if (item.target == nullptr || item.device_key == nullptr
+        || item.device_value == nullptr || item.target_capacity == 0) {
+        return;
+    }
+
+    std::size_t const token_elements = static_cast<std::size_t>(2)
+        * layout.heads * layout.dimensions;
+    std::size_t const copy_elements = static_cast<std::size_t>(
+        item.copy_token_count
+    ) * token_elements;
+    if (index < copy_elements) {
+        std::uint32_t const dimension = static_cast<std::uint32_t>(
+            index % layout.dimensions
+        );
+        std::size_t decoded = index / layout.dimensions;
+        std::uint32_t const head = static_cast<std::uint32_t>(
+            decoded % layout.heads
+        );
+        decoded /= layout.heads;
+        std::uint32_t const token = static_cast<std::uint32_t>(
+            decoded % item.copy_token_count
+        );
+        std::uint32_t const component = static_cast<std::uint32_t>(
+            decoded / item.copy_token_count
+        );
+        item.target[tensorOffset(
+            layout,
+            item.layer,
+            component,
+            token,
+            head,
+            dimension,
+            item.target_capacity
+        )] = item.copy_source[tensorOffset(
+            layout,
+            item.layer,
+            component,
+            token,
+            head,
+            dimension,
+            item.source_capacity
+        )];
+        return;
+    }
+
+    std::size_t const write_index = index - copy_elements;
+    if (write_index >= token_elements) {
+        return;
+    }
+    std::uint32_t const dimension = static_cast<std::uint32_t>(
+        write_index % layout.dimensions
+    );
+    std::size_t const decoded = write_index / layout.dimensions;
+    std::uint32_t const head = static_cast<std::uint32_t>(
+        decoded % layout.heads
+    );
+    std::uint32_t const component = static_cast<std::uint32_t>(
+        decoded / layout.heads
+    );
+    KvScalar const* source = component == 0
+        ? item.device_key : item.device_value;
+    item.target[tensorOffset(
+        layout,
+        item.layer,
+        component,
+        item.target_token,
+        head,
+        dimension,
+        item.target_capacity
+    )] = source[static_cast<std::size_t>(head) * layout.dimensions
+        + dimension];
+}
+
 __device__ KvScalar const* descriptorPage(
     ::kimkvcache::DeviceBlockDescriptor descriptor,
     KvScalar const* micro_pool,
@@ -527,6 +611,23 @@ void launchWriteLayerToken(
         layer,
         layout,
         elements
+    );
+}
+
+void launchWriteLayerTokenBatch(
+    ::kimkvcache::DeviceLayerKvWriteBatchItem const* items,
+    std::uint32_t item_count,
+    std::uint32_t max_copy_token_count,
+    DeviceLayout layout,
+    cudaStream_t stream)
+{
+    std::size_t const elements = static_cast<std::size_t>(
+        max_copy_token_count + 1
+    ) * 2 * layout.heads * layout.dimensions;
+    dim3 const scalar_grid = gridFor(elements);
+    dim3 const grid(scalar_grid.x, item_count);
+    writeLayerTokenBatchKernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+        items, layout, elements
     );
 }
 

@@ -165,6 +165,51 @@ struct LayerKvWrite final {
     KvScalar const* device_value{nullptr};
 };
 
+class TokenTransaction;
+
+// One lane of a batched layer KV write. Each lane owns an independent token
+// transaction and may resolve to a different target page/COW source.
+struct LayerKvWriteBatchItem final {
+    TokenTransaction* transaction{nullptr};
+    LayerKvWrite write{};
+    EngineKvStatus status{EngineKvError::InvalidState};
+    bool dispatched{false};
+};
+
+// Device-side metadata for one KV-write lane. copy_source/copy_token_count are
+// populated only for partial-tail COW; every valid lane writes one new token.
+struct DeviceLayerKvWriteBatchItem final {
+    KvScalar const* device_key{nullptr};
+    KvScalar const* device_value{nullptr};
+    KvScalar const* copy_source{nullptr};
+    KvScalar* target{nullptr};
+    std::uint32_t source_capacity{0};
+    std::uint32_t target_capacity{0};
+    std::uint32_t copy_token_count{0};
+    std::uint32_t target_token{0};
+    std::uint32_t layer{0};
+};
+
+static_assert(
+    std::is_trivially_copyable_v<DeviceLayerKvWriteBatchItem>,
+    "DeviceLayerKvWriteBatchItem must remain trivially copyable"
+);
+
+static_assert(
+    std::is_standard_layout_v<DeviceLayerKvWriteBatchItem>,
+    "DeviceLayerKvWriteBatchItem must remain standard-layout"
+);
+
+// host_items and device_items are caller-owned preallocated scratch. CUDA
+// backends upload the per-lane targets once and issue one layer-write kernel.
+struct LayerKvWriteBatch final {
+    LayerKvWriteBatchItem* items{nullptr};
+    std::size_t item_count{0};
+    DeviceLayerKvWriteBatchItem* host_items{nullptr};
+    DeviceLayerKvWriteBatchItem* device_items{nullptr};
+    std::size_t item_capacity{0};
+};
+
 struct PagedDecodeRequest final {
     std::uint32_t layer{0};
     KvScalar const* device_query{nullptr};
@@ -173,8 +218,6 @@ struct PagedDecodeRequest final {
     std::size_t workspace_bytes{0};
     float attention_scale{0.0F};
 };
-
-class TokenTransaction;
 
 // One lane of a ragged paged-attention launch. The caller owns the transaction
 // and all query/output/workspace storage. status is populated independently so
@@ -283,6 +326,10 @@ public:
         EngineStream stream
     ) = 0;
 
+    // The default implementation preserves compatibility through scalar
+    // submissions. CUDA backends override this when lanes share storage/stream.
+    virtual void writeLayerBatch(LayerKvWriteBatch& batch);
+
     [[nodiscard]] virtual EngineKvStatus attendLayer(
         PagedDecodeRequest const& request,
         EngineStream stream
@@ -301,6 +348,14 @@ public:
 
 protected:
     TokenTransactionBackend() = default;
+
+    [[nodiscard]] static TokenTransactionBackend* batchBackend(
+        LayerKvWriteBatchItem const& item
+    ) noexcept;
+
+    [[nodiscard]] static EngineStream batchStream(
+        LayerKvWriteBatchItem const& item
+    ) noexcept;
 
     [[nodiscard]] static TokenTransactionBackend* batchBackend(
         PagedDecodeBatchItem const& item
@@ -366,8 +421,13 @@ private:
     EngineStream stream_{nullptr};
 
     friend class TokenTransactionBackend;
+    friend void writeLayerBatch(LayerKvWriteBatch& batch);
     friend void attendLayerBatch(PagedDecodeBatch& batch);
 };
+
+// Validates every lane against the scalar transaction state machine, dispatches
+// one backend batch operation, then advances/fails lanes independently.
+void writeLayerBatch(LayerKvWriteBatch& batch);
 
 // Validates every lane against the scalar TokenTransaction state machine,
 // dispatches the backend batch operation, then advances/fails lanes separately.
@@ -392,6 +452,8 @@ struct EngineKvBackendSnapshot final {
     std::uint64_t request_count{0};
     std::uint64_t active_transaction_count{0};
     std::uint64_t committed_token_count{0};
+    std::uint64_t batched_kv_write_submissions{0};
+    std::uint64_t batched_kv_write_lanes{0};
     std::uint64_t batched_attention_submissions{0};
     std::uint64_t batched_attention_lanes{0};
     // Policy-neutral page telemetry. Fixed backends only populate primary;

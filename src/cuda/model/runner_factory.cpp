@@ -86,6 +86,7 @@ CudaModelRunnerCreateResult createCudaTinyLlamaModelRunner(
     impl->stream = reinterpret_cast<cudaStream_t>(stream);
     impl->max_batch_size = options.max_batch_size;
     try {
+        impl->host_kv_write_batch_items.resize(impl->max_batch_size);
         impl->host_attention_batch_items.resize(impl->max_batch_size);
     } catch (std::bad_alloc const&) {
         result.status = failure(

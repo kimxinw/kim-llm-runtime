@@ -809,11 +809,18 @@ void testIterationSchedulerRuntime()
         if (concurrency > 1) {
             expect(state.model_forward_batches < state.model_forward_tokens,
                 "CUDA scheduler executes multi-request dense batches");
+            expect(kv.batched_kv_write_submissions != 0
+                    && kv.batched_kv_write_lanes
+                        > kv.batched_kv_write_submissions,
+                "CUDA scheduler submits multi-lane KV-write batches");
             expect(kv.batched_attention_submissions != 0
                     && kv.batched_attention_lanes
                         > kv.batched_attention_submissions,
                 "CUDA scheduler submits multi-lane paged attention batches");
         } else {
+            expect(kv.batched_kv_write_submissions == 0
+                    && kv.batched_kv_write_lanes == 0,
+                "single-request CUDA scheduler keeps scalar KV-write path");
             expect(kv.batched_attention_submissions == 0
                     && kv.batched_attention_lanes == 0,
                 "single-request CUDA scheduler keeps scalar attention path");

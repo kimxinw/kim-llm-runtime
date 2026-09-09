@@ -25,6 +25,12 @@ public:
         CudaStatus status{CudaError::InvalidArgument, 0};
     };
 
+    struct WriteBatchItem final {
+        CudaEngineTransaction* transaction{nullptr};
+        LayerKvWrite write{};
+        CudaStatus status{CudaError::InvalidArgument, 0};
+    };
+
     ~CudaEngineTransaction();
     CudaEngineTransaction(CudaEngineTransaction const&) = delete;
     CudaEngineTransaction& operator=(CudaEngineTransaction const&) = delete;
@@ -37,6 +43,14 @@ public:
     ) noexcept;
     [[nodiscard]] CudaStatus attendLayer(
         PagedDecodeRequest const& request
+    ) noexcept;
+
+    static void writeLayerBatch(
+        WriteBatchItem* items,
+        std::size_t item_count,
+        DeviceLayerKvWriteBatchItem* host_items,
+        DeviceLayerKvWriteBatchItem* device_items,
+        std::size_t item_capacity
     ) noexcept;
 
     static void attendLayerBatch(

@@ -136,69 +136,100 @@ CudaStatus CudaEngineTransaction::status() const noexcept
     return impl_ != nullptr ? impl_->submission_status : invalidArgument();
 }
 
-CudaStatus CudaEngineTransaction::writeLayer(
-    LayerKvWrite const& write) noexcept
+CudaStatus CudaEngineTransaction::Impl::prepareWrite(
+    LayerKvWrite const& write,
+    DeviceLayerKvWriteBatchItem& item) noexcept
 {
-    if (impl_ == nullptr
-        || impl_->finished
-        || !impl_->submission_status.ok()
-        || write.layer >= impl_->storage->layout.layer_count
+    item = {};
+    if (finished
+        || !submission_status.ok()
+        || write.layer >= storage->layout.layer_count
         || write.device_key == nullptr
         || write.device_value == nullptr) {
-        return impl_ != nullptr && !impl_->submission_status.ok()
-            ? impl_->submission_status
+        return !submission_status.ok()
+            ? submission_status
             : invalidArgument();
     }
-    if (impl_->storage->consumeFailure(CudaFailurePoint::Submission)) {
-        impl_->submission_status = injectedSubmissionFailure();
-        impl_->final_status = impl_->submission_status;
-        return impl_->submission_status;
+    if (storage->consumeFailure(CudaFailurePoint::Submission)) {
+        submission_status = injectedSubmissionFailure();
+        final_status = submission_status;
+        return submission_status;
     }
 
-    MappingEntry const& target_entry = impl_->reserved.entries().back();
-    KvScalar* target = impl_->storage->pagePointer(target_entry.handle);
+    MappingEntry const& target_entry = reserved.entries().back();
+    KvScalar* target = storage->pagePointer(target_entry.handle);
     std::uint16_t const target_capacity =
-        impl_->storage->pageTokenCapacity(target_entry.kind);
+        storage->pageTokenCapacity(target_entry.kind);
     if (target == nullptr
-        || impl_->reserved.tokenCount() == 0
-        || impl_->reserved.tokenCount() - 1
+        || reserved.tokenCount() == 0
+        || reserved.tokenCount() - 1
             < target_entry.logical_token_begin) {
-        return impl_->failSubmission(cudaErrorInvalidValue);
+        return failSubmission(cudaErrorInvalidValue);
     }
 
-    if (!impl_->before.entries().empty()) {
-        MappingEntry const& old_tail = impl_->before.entries().back();
+    KvScalar const* copy_source = nullptr;
+    std::uint32_t source_capacity = 0;
+    std::uint32_t copy_token_count = 0;
+    if (!before.entries().empty()) {
+        MappingEntry const& old_tail = before.entries().back();
         if (old_tail.logical_token_begin
                 == target_entry.logical_token_begin
             && old_tail.handle != target_entry.handle) {
-            KvScalar const* source = impl_->storage->pagePointer(
-                old_tail.handle
-            );
-            if (source == nullptr) {
-                return impl_->failSubmission(cudaErrorInvalidValue);
+            copy_source = storage->pagePointer(old_tail.handle);
+            if (copy_source == nullptr) {
+                return failSubmission(cudaErrorInvalidValue);
             }
-            cuda_detail::launchCopyLayerTokens(
-                source,
-                impl_->storage->pageTokenCapacity(old_tail.kind),
-                target,
-                target_capacity,
-                old_tail.valid_tokens,
-                write.layer,
-                cuda_storage_detail::deviceLayout(impl_->storage->layout),
-                impl_->stream
-            );
+            source_capacity = storage->pageTokenCapacity(old_tail.kind);
+            copy_token_count = old_tail.valid_tokens;
         }
     }
 
-    std::uint32_t const page_token = impl_->reserved.tokenCount() - 1
+    std::uint32_t const page_token = reserved.tokenCount() - 1
         - target_entry.logical_token_begin;
-    cuda_detail::launchWriteLayerToken(
+    item = DeviceLayerKvWriteBatchItem{
         write.device_key,
         write.device_value,
+        copy_source,
         target,
+        source_capacity,
         target_capacity,
+        copy_token_count,
         page_token,
         write.layer,
+    };
+    return {};
+}
+
+CudaStatus CudaEngineTransaction::writeLayer(
+    LayerKvWrite const& write) noexcept
+{
+    if (impl_ == nullptr) {
+        return invalidArgument();
+    }
+    DeviceLayerKvWriteBatchItem item;
+    CudaStatus const prepared = impl_->prepareWrite(write, item);
+    if (!prepared.ok()) {
+        return prepared;
+    }
+    if (item.copy_token_count != 0) {
+        cuda_detail::launchCopyLayerTokens(
+            item.copy_source,
+            item.source_capacity,
+            item.target,
+            item.target_capacity,
+            item.copy_token_count,
+            item.layer,
+            cuda_storage_detail::deviceLayout(impl_->storage->layout),
+            impl_->stream
+        );
+    }
+    cuda_detail::launchWriteLayerToken(
+        item.device_key,
+        item.device_value,
+        item.target,
+        item.target_capacity,
+        item.target_token,
+        item.layer,
         cuda_storage_detail::deviceLayout(impl_->storage->layout),
         impl_->stream
     );
@@ -206,6 +237,90 @@ CudaStatus CudaEngineTransaction::writeLayer(
     return error == cudaSuccess
         ? CudaStatus{}
         : impl_->failSubmission(error);
+}
+
+void CudaEngineTransaction::writeLayerBatch(
+    WriteBatchItem* items,
+    std::size_t item_count,
+    DeviceLayerKvWriteBatchItem* host_items,
+    DeviceLayerKvWriteBatchItem* device_items,
+    std::size_t item_capacity) noexcept
+{
+    if (items == nullptr || item_count == 0 || host_items == nullptr
+        || device_items == nullptr || item_capacity < item_count
+        || item_count > std::numeric_limits<std::uint32_t>::max()
+        || item_count > std::numeric_limits<std::size_t>::max()
+            / sizeof(DeviceLayerKvWriteBatchItem)) {
+        if (items != nullptr) {
+            for (std::size_t index = 0; index < item_count; ++index) {
+                items[index].status = invalidArgument();
+            }
+        }
+        return;
+    }
+
+    std::shared_ptr<CudaKvStorage::Impl> storage;
+    cudaStream_t stream = nullptr;
+    std::uint32_t max_copy_token_count = 0;
+    std::size_t ready_count = 0;
+    for (std::size_t index = 0; index < item_count; ++index) {
+        host_items[index] = {};
+        WriteBatchItem& item = items[index];
+        if (item.transaction == nullptr || item.transaction->impl_ == nullptr) {
+            item.status = invalidArgument();
+            continue;
+        }
+        Impl& impl = *item.transaction->impl_;
+        if (storage == nullptr) {
+            storage = impl.storage;
+            stream = impl.stream;
+        } else if (impl.storage.get() != storage.get()
+            || impl.stream != stream) {
+            item.status = invalidArgument();
+            continue;
+        }
+        item.status = impl.prepareWrite(item.write, host_items[index]);
+        if (item.status.ok()) {
+            ++ready_count;
+            max_copy_token_count = std::max(
+                max_copy_token_count, host_items[index].copy_token_count
+            );
+        }
+    }
+    if (ready_count == 0 || storage == nullptr) {
+        return;
+    }
+
+    std::size_t const metadata_bytes =
+        item_count * sizeof(DeviceLayerKvWriteBatchItem);
+    cudaError_t error = cudaMemcpyAsync(
+        device_items,
+        host_items,
+        metadata_bytes,
+        cudaMemcpyHostToDevice,
+        stream
+    );
+    if (error == cudaSuccess) {
+        cuda_detail::launchWriteLayerTokenBatch(
+            device_items,
+            static_cast<std::uint32_t>(item_count),
+            max_copy_token_count,
+            cuda_storage_detail::deviceLayout(storage->layout),
+            stream
+        );
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        return;
+    }
+    for (std::size_t index = 0; index < item_count; ++index) {
+        if (items[index].status.ok()
+            && items[index].transaction != nullptr
+            && items[index].transaction->impl_ != nullptr) {
+            items[index].status =
+                items[index].transaction->impl_->failSubmission(error);
+        }
+    }
 }
 
 CudaStatus CudaEngineTransaction::attendLayer(

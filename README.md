@@ -31,7 +31,7 @@ flowchart LR
 ### 2. CUDA Model Runner
 
 - 完整 TinyLlama FP16 Decoder、LM Head 和 Greedy Argmax
-- 基于 cuBLAS 的动态 Batched GEMM，支持 GQA Paged Decode Attention
+- 基于 cuBLAS 的动态 Batched GEMM，支持 Batched KV Write 与 GQA Paged Decode Attention
 - 预分配执行 Workspace，权重 Manifest 校验 Shape、Offset 与 SHA-256
 
 ### 3. Iteration Scheduler
@@ -93,6 +93,6 @@ scripts/run_e5_end_to_end.sh
 
 - 单 GPU、单模型、同步 Scheduler
 - Ragged Batched Paged Attention 已实现
-- KV Write 与事务提交仍按 Batch Lane 处理，Attention Scores 与 Output 仍为两个 Kernel
+- KV Batch Metadata 每层仍需上传，事务提交仍按 Lane 处理，Attention Scores 与 Output 仍为两个 Kernel
 - Chunk 内按因果 Wave 逐 Token 推进，尚未实现融合的多 Token Prefill Attention
 - 自动 Promotion 当前在 Token Commit 边界同步执行；失败后不做后台重试

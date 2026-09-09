@@ -664,6 +664,246 @@ void testExtentPagedAttention()
     static_cast<void>(cudaFree(device_input));
 }
 
+void testBatchedWritePreservesCowHistory(EngineKvBackendKind kind)
+{
+    EngineKvConfig const config{KvLayout{1, 1, 2}, 2, 4096};
+    std::unique_ptr<EngineKvBackend> backend =
+        kind == EngineKvBackendKind::Heterogeneous
+        ? createHeterogeneousCudaEngineKvBackend(config, 16, 2)
+        : createFixedCudaEngineKvBackend(config, 8, 16);
+    expect(backend != nullptr, "create batched-write COW backend");
+    expect(backend->createRequest(90).ok(), "create COW source request");
+    expect(backend->createRequest(92).ok(), "create independent request");
+
+    cudaStream_t stream = nullptr;
+    expect(cudaStreamCreate(&stream) == cudaSuccess,
+        "create shared batched-write COW stream");
+    DeviceBuffers source(stream);
+    DeviceBuffers child(stream);
+    DeviceBuffers independent(stream);
+    std::vector<KvScalar> const query{
+        fp16(0.5F), fp16(0.25F), fp16(-0.2F), fp16(0.4F),
+    };
+    auto uploadToken = [&](DeviceBuffers& device, int token) {
+        std::vector<KvScalar> const key{
+            fp16(0.1F * static_cast<float>(token + 1) + 0.02F),
+            fp16(-0.05F * static_cast<float>(token) + 0.01F),
+        };
+        std::vector<KvScalar> const value{
+            fp16(static_cast<float>(token + 1) + 0.2F),
+            fp16(static_cast<float>(token + 1) * 0.5F - 0.1F),
+        };
+        expect(cudaMemcpyAsync(
+            device.query, query.data(), 8, cudaMemcpyHostToDevice, stream
+        ) == cudaSuccess, "upload batched-write COW query");
+        expect(cudaMemcpyAsync(
+            device.key, key.data(), 4, cudaMemcpyHostToDevice, stream
+        ) == cudaSuccess, "upload batched-write COW key");
+        expect(cudaMemcpyAsync(
+            device.value, value.data(), 4, cudaMemcpyHostToDevice, stream
+        ) == cudaSuccess, "upload batched-write COW value");
+    };
+
+    uploadToken(source, 0);
+    TokenReserveResult seeded = backend->reserveToken({
+        90, 0, reinterpret_cast<EngineStream>(stream),
+    });
+    expect(seeded.ok(), "reserve COW source token");
+    expect(seeded.transaction.writeLayer({0, source.key, source.value}).ok(),
+        "write COW source token");
+    expect(seeded.transaction.attendLayer({
+        0, source.query, source.output, source.workspace, 4096,
+        1.0F / std::sqrt(2.0F),
+    }).ok(), "attend COW source token");
+    expect(seeded.transaction.commit().ok(), "commit COW source token");
+    expect(backend->forkRequest(90, 91).ok(), "fork partial-tail child");
+
+    uploadToken(child, 1);
+    uploadToken(independent, 2);
+    TokenReserveResult child_reserved = backend->reserveToken({
+        91, 1, reinterpret_cast<EngineStream>(stream),
+    });
+    TokenReserveResult independent_reserved = backend->reserveToken({
+        92, 0, reinterpret_cast<EngineStream>(stream),
+    });
+    expect(child_reserved.ok() && independent_reserved.ok(),
+        "reserve COW and independent batch lanes");
+    std::array<LayerKvWriteBatchItem, 2> items{{
+        {&child_reserved.transaction, {0, child.key, child.value}},
+        {&independent_reserved.transaction,
+            {0, independent.key, independent.value}},
+    }};
+    std::array<DeviceLayerKvWriteBatchItem, 2> host_items{};
+    DeviceLayerKvWriteBatchItem* device_items = nullptr;
+    expect(cudaMalloc(
+        reinterpret_cast<void**>(&device_items),
+        sizeof(DeviceLayerKvWriteBatchItem) * items.size()
+    ) == cudaSuccess, "allocate batched-write COW metadata");
+    LayerKvWriteBatch batch{
+        items.data(), items.size(), host_items.data(), device_items,
+        host_items.size(),
+    };
+    writeLayerBatch(batch);
+    expect(items[0].status.ok() && items[1].status.ok(),
+        "COW and independent batch lanes both write");
+    expect(child_reserved.transaction.attendLayer({
+        0, child.query, child.output, child.workspace, 4096,
+        1.0F / std::sqrt(2.0F),
+    }).ok(), "COW child attends copied history");
+    expect(independent_reserved.transaction.attendLayer({
+        0, independent.query, independent.output, independent.workspace, 4096,
+        1.0F / std::sqrt(2.0F),
+    }).ok(), "independent lane attends its own token");
+    expect(child_reserved.transaction.commit().ok(), "commit COW child");
+    expect(independent_reserved.transaction.commit().ok(),
+        "commit independent batch lane");
+
+    auto checkOutput = [&](DeviceBuffers& device,
+                           std::vector<int> const& history,
+                           int token,
+                           std::string const& message) {
+        std::array<KvScalar, 4> actual{};
+        expect(cudaMemcpy(
+            actual.data(), device.output, 8, cudaMemcpyDeviceToHost
+        ) == cudaSuccess, "download batched-write COW output");
+        std::vector<float> const expected = referenceOutput(history, token);
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            expect(std::abs(fp32(actual[index]) - expected[index]) < 0.035F,
+                message);
+        }
+    };
+    checkOutput(child, {0}, 1,
+        "batched-write COW preserves shared history");
+    checkOutput(independent, {}, 2,
+        "batched-write independent lane preserves isolation");
+    EngineKvBackendSnapshot const snapshot = backend->snapshot();
+    expect(snapshot.batched_kv_write_submissions == 1
+            && snapshot.batched_kv_write_lanes == 2,
+        "COW batch records one two-lane write submission");
+    expect(backend->releaseRequest(92).ok(), "release independent request");
+    expect(backend->releaseRequest(91).ok(), "release COW child request");
+    expect(backend->releaseRequest(90).ok(), "release COW source request");
+    expect(backend->checkInvariants(), "batched-write COW invariants");
+
+    static_cast<void>(cudaFree(device_items));
+    static_cast<void>(cudaStreamDestroy(stream));
+}
+
+void testBatchedWriteFailureIsolation(EngineKvBackendKind kind)
+{
+    EngineKvConfig const config{KvLayout{1, 1, 2}, 2, 4096};
+    std::unique_ptr<EngineKvBackend> backend =
+        kind == EngineKvBackendKind::Heterogeneous
+        ? createHeterogeneousCudaEngineKvBackend(config, 16, 2)
+        : createFixedCudaEngineKvBackend(config, 8, 16);
+    expect(backend != nullptr, "create batched-write isolation backend");
+    expect(backend->createRequest(80).ok(),
+        "create failing batched-write request");
+    expect(backend->createRequest(81).ok(),
+        "create healthy batched-write request");
+
+    cudaStream_t stream = nullptr;
+    expect(cudaStreamCreate(&stream) == cudaSuccess,
+        "create shared batched-write stream");
+    DeviceBuffers first(stream);
+    DeviceBuffers second(stream);
+    TokenReserveResult first_reserved = backend->reserveToken({
+        80, 0, reinterpret_cast<EngineStream>(stream),
+    });
+    TokenReserveResult second_reserved = backend->reserveToken({
+        81, 0, reinterpret_cast<EngineStream>(stream),
+    });
+    expect(first_reserved.ok() && second_reserved.ok(),
+        "reserve two independent batched-write lanes");
+
+    std::vector<KvScalar> const query{
+        fp16(0.5F), fp16(0.25F), fp16(-0.2F), fp16(0.4F),
+    };
+    std::vector<KvScalar> const first_key{fp16(0.1F), fp16(0.2F)};
+    std::vector<KvScalar> const first_value{fp16(1.0F), fp16(2.0F)};
+    std::vector<KvScalar> const second_key{fp16(0.3F), fp16(0.4F)};
+    std::vector<KvScalar> const second_value{fp16(3.0F), fp16(4.0F)};
+    auto upload = [&](DeviceBuffers& device,
+                      std::vector<KvScalar> const& key,
+                      std::vector<KvScalar> const& value) {
+        expect(cudaMemcpyAsync(
+            device.query, query.data(), 8, cudaMemcpyHostToDevice, stream
+        ) == cudaSuccess, "upload batched-write query");
+        expect(cudaMemcpyAsync(
+            device.key, key.data(), 4, cudaMemcpyHostToDevice, stream
+        ) == cudaSuccess, "upload batched-write key");
+        expect(cudaMemcpyAsync(
+            device.value, value.data(), 4, cudaMemcpyHostToDevice, stream
+        ) == cudaSuccess, "upload batched-write value");
+    };
+    upload(first, first_key, first_value);
+    upload(second, second_key, second_value);
+
+    expect(injectCudaEngineFailureOnce(
+        *backend, CudaFailurePoint::Submission),
+        "inject one batched-write submission failure");
+    std::array<LayerKvWriteBatchItem, 2> items{{
+        {&first_reserved.transaction, {0, first.key, first.value}},
+        {&second_reserved.transaction, {0, second.key, second.value}},
+    }};
+    std::array<DeviceLayerKvWriteBatchItem, 2> host_items{};
+    DeviceLayerKvWriteBatchItem* device_items = nullptr;
+    expect(cudaMalloc(
+        reinterpret_cast<void**>(&device_items),
+        sizeof(DeviceLayerKvWriteBatchItem) * items.size()
+    ) == cudaSuccess, "allocate batched-write lane metadata");
+    LayerKvWriteBatch batch{
+        items.data(),
+        items.size(),
+        host_items.data(),
+        device_items,
+        host_items.size(),
+    };
+    writeLayerBatch(batch);
+    expect(items[0].status.error == EngineKvError::SubmissionFailed,
+        "injected batched-write lane fails closed");
+    expect(items[1].status.ok(),
+        "healthy batched-write lane survives another lane failure");
+    expect(first_reserved.transaction.rollback().ok(),
+        "failed batched-write lane rolls back");
+    expect(second_reserved.transaction.attendLayer({
+        0,
+        second.query,
+        second.output,
+        second.workspace,
+        4096,
+        1.0F / std::sqrt(2.0F),
+    }).ok(), "healthy batched-write lane attends");
+    expect(second_reserved.transaction.commit().ok(),
+        "healthy batched-write lane commits");
+
+    std::array<KvScalar, 4> output{};
+    expect(cudaMemcpy(
+        output.data(), second.output, 8, cudaMemcpyDeviceToHost
+    ) == cudaSuccess, "download healthy batched-write output");
+    expect(std::abs(fp32(output[0]) - 3.0F) < 0.01F
+            && std::abs(fp32(output[1]) - 4.0F) < 0.01F
+            && std::abs(fp32(output[2]) - 3.0F) < 0.01F
+            && std::abs(fp32(output[3]) - 4.0F) < 0.01F,
+        "healthy batched-write lane stores independent K/V");
+    EngineKvBackendSnapshot const snapshot = backend->snapshot();
+    expect(snapshot.committed_token_count == 1
+            && snapshot.active_transaction_count == 0,
+        "batched-write failure publishes only the healthy lane");
+    expect(snapshot.batched_kv_write_submissions == 1
+            && snapshot.batched_kv_write_lanes == 1,
+        "batched-write telemetry records the surviving lane");
+    expect(backend->releaseRequest(81).ok(),
+        "release healthy batched-write request");
+    expect(backend->releaseRequest(80).ok(),
+        "release failed batched-write request");
+    expect(backend->checkInvariants(),
+        "batched-write failure isolation invariants");
+
+    static_cast<void>(cudaFree(device_items));
+    static_cast<void>(cudaStreamDestroy(stream));
+}
+
 void testBatchedAttentionFailureIsolation(EngineKvBackendKind kind)
 {
     EngineKvConfig const config{KvLayout{1, 1, 2}, 2, 4096};
@@ -789,6 +1029,12 @@ int main()
     testAutomaticPromotionFailureIsBestEffort();
     testAutomaticPromotionCanBeDisabled();
     testAutomaticPromotionExtentExhaustion();
+    testBatchedWritePreservesCowHistory(
+        EngineKvBackendKind::Heterogeneous
+    );
+    testBatchedWritePreservesCowHistory(EngineKvBackendKind::Fixed);
+    testBatchedWriteFailureIsolation(EngineKvBackendKind::Heterogeneous);
+    testBatchedWriteFailureIsolation(EngineKvBackendKind::Fixed);
     testBatchedAttentionFailureIsolation(
         EngineKvBackendKind::Heterogeneous
     );

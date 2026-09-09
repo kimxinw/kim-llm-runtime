@@ -79,6 +79,8 @@ struct EngineBackendState final {
     CudaKvStorage storage;
     std::unordered_map<RequestId, std::uint32_t> committed_lengths{};
     std::uint64_t active_transactions{0};
+    std::atomic<std::uint64_t> batched_kv_write_submissions{0};
+    std::atomic<std::uint64_t> batched_kv_write_lanes{0};
     std::atomic<std::uint64_t> batched_attention_submissions{0};
     std::atomic<std::uint64_t> batched_attention_lanes{0};
     std::uint64_t automatic_promotion_attempts{0};
@@ -280,6 +282,69 @@ public:
         EngineStream) override
     {
         return mapCuda(io_->writeLayer(write));
+    }
+
+    void writeLayerBatch(LayerKvWriteBatch& batch) override
+    {
+        constexpr std::size_t kStackBatchCapacity = 64;
+        std::array<CudaEngineTransaction::WriteBatchItem,
+            kStackBatchCapacity> cuda_items{};
+        std::size_t cuda_count = 0;
+        EngineStream common_stream = nullptr;
+
+        for (std::size_t index = 0; index < batch.item_count; ++index) {
+            LayerKvWriteBatchItem const& item = batch.items[index];
+            if (!item.status.ok()) {
+                continue;
+            }
+            auto* const backend = dynamic_cast<CudaTokenTransactionBackend*>(
+                batchBackend(item)
+            );
+            EngineStream const stream = batchStream(item);
+            if (backend == nullptr || backend->owner_.get() != owner_.get()
+                || (cuda_count != 0 && stream != common_stream)
+                || cuda_count == kStackBatchCapacity) {
+                TokenTransactionBackend::writeLayerBatch(batch);
+                return;
+            }
+            if (cuda_count == 0) {
+                common_stream = stream;
+            }
+            cuda_items[cuda_count++] = {
+                backend->io_.get(), item.write, {},
+            };
+        }
+        if (cuda_count < 2) {
+            TokenTransactionBackend::writeLayerBatch(batch);
+            return;
+        }
+
+        CudaEngineTransaction::writeLayerBatch(
+            cuda_items.data(),
+            cuda_count,
+            batch.host_items,
+            batch.device_items,
+            batch.item_capacity
+        );
+
+        std::size_t cuda_index = 0;
+        std::uint64_t successful_lanes = 0;
+        for (std::size_t index = 0; index < batch.item_count; ++index) {
+            LayerKvWriteBatchItem& item = batch.items[index];
+            if (!item.status.ok()) {
+                continue;
+            }
+            item.status = mapCuda(cuda_items[cuda_index++].status);
+            successful_lanes += item.status.ok() ? 1U : 0U;
+        }
+        if (successful_lanes != 0) {
+            owner_->batched_kv_write_submissions.fetch_add(
+                1, std::memory_order_relaxed
+            );
+            owner_->batched_kv_write_lanes.fetch_add(
+                successful_lanes, std::memory_order_relaxed
+            );
+        }
     }
 
     [[nodiscard]] EngineKvStatus attendLayer(
@@ -596,6 +661,12 @@ public:
         result.request_count = state_->committed_lengths.size();
         result.active_transaction_count = state_->active_transactions;
         result.committed_token_count = committed;
+        result.batched_kv_write_submissions =
+            state_->batched_kv_write_submissions.load(
+                std::memory_order_relaxed
+            );
+        result.batched_kv_write_lanes =
+            state_->batched_kv_write_lanes.load(std::memory_order_relaxed);
         result.batched_attention_submissions =
             state_->batched_attention_submissions.load(
                 std::memory_order_relaxed
