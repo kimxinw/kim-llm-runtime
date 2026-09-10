@@ -98,6 +98,85 @@ __global__ void writeLayerTokenKernel(
         + dimension];
 }
 
+__device__ ::kimkvcache::DeviceBlockDescriptor findDescriptor(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    std::uint32_t token);
+
+__device__ KvScalar* descriptorMutablePage(
+    ::kimkvcache::DeviceBlockDescriptor descriptor,
+    KvScalar* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar* extent_pool,
+    std::size_t extent_page_elements)
+{
+    return descriptor.kind == PageKind::Micro
+        ? micro_pool + static_cast<std::size_t>(descriptor.slot)
+            * micro_page_elements
+        : extent_pool + static_cast<std::size_t>(descriptor.slot)
+            * extent_page_elements;
+}
+
+__global__ void writeLayerTokensKernel(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    KvScalar* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t logical_token_begin,
+    std::uint32_t token_count,
+    std::uint32_t layer,
+    KvScalar const* key,
+    KvScalar const* value,
+    DeviceLayout layout,
+    std::size_t element_count)
+{
+    std::size_t const index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= element_count) {
+        return;
+    }
+    std::uint32_t const dimension = static_cast<std::uint32_t>(
+        index % layout.dimensions
+    );
+    std::size_t decoded = index / layout.dimensions;
+    std::uint32_t const head = static_cast<std::uint32_t>(
+        decoded % layout.heads
+    );
+    decoded /= layout.heads;
+    std::uint32_t const token = static_cast<std::uint32_t>(
+        decoded % token_count
+    );
+    std::uint32_t const component = static_cast<std::uint32_t>(
+        decoded / token_count
+    );
+    std::uint32_t const logical_token = logical_token_begin + token;
+    ::kimkvcache::DeviceBlockDescriptor const descriptor = findDescriptor(
+        descriptors, descriptor_count, logical_token
+    );
+    KvScalar* const target = descriptorMutablePage(
+        descriptor,
+        micro_pool,
+        micro_page_elements,
+        extent_pool,
+        extent_page_elements
+    );
+    KvScalar const* const source = component == 0 ? key : value;
+    std::size_t const source_offset =
+        (static_cast<std::size_t>(token) * layout.heads + head)
+            * layout.dimensions + dimension;
+    target[tensorOffset(
+        layout,
+        layer,
+        component,
+        logical_token - descriptor.logical_token_begin,
+        head,
+        dimension,
+        descriptor.page_token_capacity
+    )] = source[source_offset];
+}
+
 __global__ void writeLayerTokenBatchKernel(
     ::kimkvcache::DeviceLayerKvWriteBatchItem const* items,
     DeviceLayout layout,
@@ -381,6 +460,182 @@ __global__ void pagedAttentionOutputKernel(
     }
 }
 
+__global__ void pagedPrefillScoresKernel(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t total_token_count,
+    std::uint32_t query_token_count,
+    std::uint32_t layer,
+    std::uint32_t query_head_count,
+    KvScalar const* query,
+    float* scores,
+    float attention_scale,
+    DeviceLayout layout)
+{
+    extern __shared__ float reduction[];
+    std::uint32_t const query_head = blockIdx.x;
+    std::uint32_t const query_token = blockIdx.y;
+    std::uint32_t const visible_tokens =
+        total_token_count - query_token_count + query_token + 1;
+    std::uint32_t const group_size = query_head_count / layout.heads;
+    std::uint32_t const kv_head = query_head / group_size;
+    std::size_t const query_base =
+        (static_cast<std::size_t>(query_token) * query_head_count
+            + query_head) * layout.dimensions;
+    float* const head_scores = scores
+        + (static_cast<std::size_t>(query_token) * query_head_count
+            + query_head) * total_token_count;
+
+    for (std::uint32_t token = 0; token < visible_tokens; ++token) {
+        ::kimkvcache::DeviceBlockDescriptor const descriptor =
+            findDescriptor(descriptors, descriptor_count, token);
+        KvScalar const* const page = descriptorPage(
+            descriptor,
+            micro_pool,
+            micro_page_elements,
+            extent_pool,
+            extent_page_elements
+        );
+        float partial = 0.0F;
+        for (std::uint32_t dimension = threadIdx.x;
+             dimension < layout.dimensions;
+             dimension += blockDim.x) {
+            __half const q = reinterpret_cast<__half const*>(query)[
+                query_base + dimension
+            ];
+            __half const key = reinterpret_cast<__half const*>(page)[
+                tensorOffset(
+                    layout,
+                    layer,
+                    0,
+                    token - descriptor.logical_token_begin,
+                    kv_head,
+                    dimension,
+                    descriptor.page_token_capacity
+                )
+            ];
+            partial += __half2float(q) * __half2float(key);
+        }
+        reduction[threadIdx.x] = partial;
+        __syncthreads();
+        for (unsigned int stride = blockDim.x / 2;
+             stride != 0;
+             stride /= 2) {
+            if (threadIdx.x < stride) {
+                reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            head_scores[token] = reduction[0] * attention_scale;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void pagedPrefillOutputKernel(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t total_token_count,
+    std::uint32_t query_token_count,
+    std::uint32_t layer,
+    std::uint32_t query_head_count,
+    float const* scores,
+    KvScalar* output,
+    DeviceLayout layout)
+{
+    extern __shared__ float reduction[];
+    std::uint32_t const query_head = blockIdx.x;
+    std::uint32_t const query_token = blockIdx.y;
+    std::uint32_t const visible_tokens =
+        total_token_count - query_token_count + query_token + 1;
+    std::uint32_t const group_size = query_head_count / layout.heads;
+    std::uint32_t const kv_head = query_head / group_size;
+    float const* const head_scores = scores
+        + (static_cast<std::size_t>(query_token) * query_head_count
+            + query_head) * total_token_count;
+
+    float local_maximum = -FLT_MAX;
+    for (std::uint32_t token = threadIdx.x;
+         token < visible_tokens;
+         token += blockDim.x) {
+        local_maximum = fmaxf(local_maximum, head_scores[token]);
+    }
+    reduction[threadIdx.x] = local_maximum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2;
+         stride != 0;
+         stride /= 2) {
+        if (threadIdx.x < stride) {
+            reduction[threadIdx.x] = fmaxf(
+                reduction[threadIdx.x], reduction[threadIdx.x + stride]
+            );
+        }
+        __syncthreads();
+    }
+    float const maximum = reduction[0];
+    __syncthreads();
+    float local_sum = 0.0F;
+    for (std::uint32_t token = threadIdx.x;
+         token < visible_tokens;
+         token += blockDim.x) {
+        local_sum += expf(head_scores[token] - maximum);
+    }
+    reduction[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2;
+         stride != 0;
+         stride /= 2) {
+        if (threadIdx.x < stride) {
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    float const denominator = reduction[0];
+
+    for (std::uint32_t dimension = threadIdx.x;
+         dimension < layout.dimensions;
+         dimension += blockDim.x) {
+        float weighted_value = 0.0F;
+        for (std::uint32_t token = 0; token < visible_tokens; ++token) {
+            ::kimkvcache::DeviceBlockDescriptor const descriptor =
+                findDescriptor(descriptors, descriptor_count, token);
+            KvScalar const* const page = descriptorPage(
+                descriptor,
+                micro_pool,
+                micro_page_elements,
+                extent_pool,
+                extent_page_elements
+            );
+            __half const value = reinterpret_cast<__half const*>(page)[
+                tensorOffset(
+                    layout,
+                    layer,
+                    1,
+                    token - descriptor.logical_token_begin,
+                    kv_head,
+                    dimension,
+                    descriptor.page_token_capacity
+                )
+            ];
+            weighted_value += expf(head_scores[token] - maximum)
+                * __half2float(value);
+        }
+        reinterpret_cast<__half*>(output)[
+            (static_cast<std::size_t>(query_token) * query_head_count
+                + query_head) * layout.dimensions + dimension
+        ] = __float2half(weighted_value / denominator);
+    }
+}
+
 __global__ void pagedAttentionScoresBatchKernel(
     ::kimkvcache::DevicePagedDecodeBatchItem const* items,
     KvScalar const* micro_pool,
@@ -614,6 +869,41 @@ void launchWriteLayerToken(
     );
 }
 
+void launchWriteLayerTokens(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    KvScalar* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t logical_token_begin,
+    std::uint32_t token_count,
+    std::uint32_t layer,
+    KvScalar const* key,
+    KvScalar const* value,
+    DeviceLayout layout,
+    cudaStream_t stream)
+{
+    std::size_t const elements = static_cast<std::size_t>(2)
+        * token_count * layout.heads * layout.dimensions;
+    writeLayerTokensKernel<<<
+        gridFor(elements), kThreadsPerBlock, 0, stream>>>(
+        descriptors,
+        descriptor_count,
+        micro_pool,
+        micro_page_elements,
+        extent_pool,
+        extent_page_elements,
+        logical_token_begin,
+        token_count,
+        layer,
+        key,
+        value,
+        layout,
+        elements
+    );
+}
+
 void launchWriteLayerTokenBatch(
     ::kimkvcache::DeviceLayerKvWriteBatchItem const* items,
     std::uint32_t item_count,
@@ -674,6 +964,61 @@ void launchPagedDecodeAttention(
         extent_pool,
         extent_page_elements,
         token_count,
+        layer,
+        query_head_count,
+        scores,
+        output,
+        layout
+    );
+}
+
+void launchPagedPrefillAttention(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t total_token_count,
+    std::uint32_t query_token_count,
+    std::uint32_t layer,
+    std::uint32_t query_head_count,
+    KvScalar const* query,
+    float* scores,
+    KvScalar* output,
+    float attention_scale,
+    DeviceLayout layout,
+    cudaStream_t stream)
+{
+    std::size_t const shared_bytes = kThreadsPerBlock * sizeof(float);
+    dim3 const grid(query_head_count, query_token_count);
+    pagedPrefillScoresKernel<<<
+        grid, kThreadsPerBlock, shared_bytes, stream>>>(
+        descriptors,
+        descriptor_count,
+        micro_pool,
+        micro_page_elements,
+        extent_pool,
+        extent_page_elements,
+        total_token_count,
+        query_token_count,
+        layer,
+        query_head_count,
+        query,
+        scores,
+        attention_scale,
+        layout
+    );
+    pagedPrefillOutputKernel<<<
+        grid, kThreadsPerBlock, shared_bytes, stream>>>(
+        descriptors,
+        descriptor_count,
+        micro_pool,
+        micro_page_elements,
+        extent_pool,
+        extent_page_elements,
+        total_token_count,
+        query_token_count,
         layer,
         query_head_count,
         scores,

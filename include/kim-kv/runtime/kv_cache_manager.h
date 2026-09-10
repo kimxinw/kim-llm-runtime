@@ -68,6 +68,12 @@ public:
         std::uint32_t expected_committed_tokens
     );
 
+    [[nodiscard]] TokenReservationResult reserveTokens(
+        RequestId request_id,
+        std::uint32_t expected_committed_tokens,
+        std::uint32_t token_count
+    );
+
     [[nodiscard]] KvCacheError commitTokenReservation(
         KvTokenReservationId reservation_id
     );
@@ -170,8 +176,9 @@ private:
         KvTokenReservationId reservation_id{kInvalidKvTokenReservationId};
         RequestId request_id{kInvalidRequestId};
         std::uint64_t prepared_table_version{0};
+        std::uint32_t token_count{0};
         BlockTable candidate{};
-        PageHandle staged_target{PageHandle::invalid()};
+        std::vector<StagedPage> staged_pages{};
         PageHandle existing_mutable{PageHandle::invalid()};
         PageHandle replaced_sealed_tail{PageHandle::invalid()};
     };

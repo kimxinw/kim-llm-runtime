@@ -410,13 +410,37 @@ TinyLlamaConfig CudaTinyLlamaModelRunner::generationConfig() const noexcept
 GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
     std::vector<GenerationBatchItem> const& batch)
 {
+    std::vector<GenerationChunkItem> chunks;
+    try {
+        chunks.reserve(batch.size());
+        for (GenerationBatchItem const& item : batch) {
+            chunks.push_back(GenerationChunkItem{
+                item.request_id,
+                std::vector<std::uint32_t>{item.token_id},
+                item.expected_position,
+            });
+        }
+    } catch (std::bad_alloc const&) {
+        return {false, {}, "generation batch conversion failed"};
+    }
+    return generationForwardChunks(chunks);
+}
+
+GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardChunks(
+    std::vector<GenerationChunkItem> const& chunks)
+{
     GenerationBatchResult result;
     if (impl_ == nullptr || impl_->backend == nullptr) {
         result.detail = "runner is empty";
         return result;
     }
-    if (batch.empty() || batch.size() > impl_->max_batch_size) {
-        result.detail = "generation batch is empty or exceeds max batch size";
+    std::size_t total_input_tokens = 0;
+    for (GenerationChunkItem const& chunk : chunks) {
+        total_input_tokens += chunk.token_ids.size();
+    }
+    if (chunks.empty() || total_input_tokens == 0
+        || total_input_tokens > impl_->max_batch_size) {
+        result.detail = "generation chunks are empty or exceed max token batch size";
         return result;
     }
 
@@ -424,38 +448,52 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
     std::vector<std::size_t> active_indices;
     std::vector<std::uint32_t> token_ids;
     std::vector<std::uint32_t> positions;
+    std::vector<std::uint32_t> chunk_offsets;
+    std::vector<std::uint32_t> chunk_counts;
     std::vector<TokenTransaction> transactions;
     std::vector<LayerKvWriteBatchItem> kv_write_batch_items;
     std::vector<PagedDecodeBatchItem> attention_batch_items;
     try {
-        result.steps.resize(batch.size());
-        kv_write_batch_items.resize(batch.size());
-        attention_batch_items.resize(batch.size());
-        active_indices.reserve(batch.size());
-        token_ids.reserve(batch.size());
-        positions.reserve(batch.size());
-        transactions.reserve(batch.size());
+        result.steps.resize(chunks.size());
+        kv_write_batch_items.resize(chunks.size());
+        attention_batch_items.resize(chunks.size());
+        active_indices.reserve(chunks.size());
+        token_ids.reserve(total_input_tokens);
+        positions.reserve(total_input_tokens);
+        chunk_offsets.reserve(chunks.size());
+        chunk_counts.reserve(chunks.size());
+        transactions.reserve(chunks.size());
     } catch (std::bad_alloc const&) {
         result.steps.clear();
         result.detail = "batch host workspace allocation failed";
         return result;
     }
 
-    for (std::size_t index = 0; index < batch.size(); ++index) {
-        GenerationBatchItem const& item = batch[index];
-        if (item.request_id == kInvalidRequestId
-            || item.token_id >= config.vocabulary_size
-            || item.expected_position >= config.max_position_embeddings) {
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+        GenerationChunkItem const& item = chunks[index];
+        bool invalid_token = item.token_ids.empty();
+        for (std::uint32_t token : item.token_ids) {
+            invalid_token = invalid_token || token >= config.vocabulary_size;
+        }
+        if (item.request_id == kInvalidRequestId || invalid_token
+            || item.token_ids.size() > std::numeric_limits<std::uint32_t>::max()
+            || item.expected_position >= config.max_position_embeddings
+            || item.token_ids.size() > config.max_position_embeddings
+                - item.expected_position) {
             result.steps[index] = {
-                false, 0, "request, token, or position is out of range",
+                false, 0, "request, chunk token, or position is out of range",
             };
             continue;
         }
+        std::uint32_t const token_count = static_cast<std::uint32_t>(
+            item.token_ids.size()
+        );
         TokenReserveResult reserved = impl_->backend->reserveToken(
             ReserveTokenRequest{
                 item.request_id,
                 item.expected_position,
                 reinterpret_cast<EngineStream>(impl_->stream),
+                token_count,
             }
         );
         if (!reserved.ok()) {
@@ -467,8 +505,16 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
         }
         try {
             active_indices.push_back(index);
-            token_ids.push_back(item.token_id);
-            positions.push_back(item.expected_position);
+            chunk_offsets.push_back(static_cast<std::uint32_t>(
+                token_ids.size()
+            ));
+            chunk_counts.push_back(token_count);
+            token_ids.insert(
+                token_ids.end(), item.token_ids.begin(), item.token_ids.end()
+            );
+            for (std::uint32_t offset = 0; offset < token_count; ++offset) {
+                positions.push_back(item.expected_position + offset);
+            }
             transactions.push_back(std::move(reserved.transaction));
         } catch (std::bad_alloc const&) {
             result.steps[index] = {
@@ -481,10 +527,13 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
         return result;
     }
 
-    std::uint32_t const batch_size = static_cast<std::uint32_t>(
+    std::uint32_t const chunk_count = static_cast<std::uint32_t>(
         active_indices.size()
     );
-    std::vector<bool> active(batch_size, true);
+    std::uint32_t const batch_size = static_cast<std::uint32_t>(
+        token_ids.size()
+    );
+    std::vector<bool> active(chunk_count, true);
     std::vector<std::uint32_t> greedy_tokens;
     try {
         greedy_tokens.resize(batch_size);
@@ -498,7 +547,7 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
     }
 
     auto failActive = [&](std::string const& detail) {
-        for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+        for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
             if (active[lane]) {
                 result.steps[active_indices[lane]] = {false, 0, detail};
                 active[lane] = false;
@@ -644,15 +693,16 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
         auto kvWrite = [&](std::uint32_t lane) {
             return LayerKvWrite{
                 layer,
-                key + static_cast<std::size_t>(lane) * kv_size,
-                value + static_cast<std::size_t>(lane) * kv_size,
+                key + static_cast<std::size_t>(chunk_offsets[lane]) * kv_size,
+                value + static_cast<std::size_t>(chunk_offsets[lane]) * kv_size,
+                chunk_counts[lane],
             };
         };
         std::size_t const write_lane_count = static_cast<std::size_t>(
             std::count(active.begin(), active.end(), true)
         );
         if (write_lane_count == 1) {
-            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+            for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
                 if (!active[lane]) {
                     continue;
                 }
@@ -667,7 +717,7 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
                 }
             }
         } else {
-            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+            for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
                 kv_write_batch_items[lane] = {};
                 if (active[lane]) {
                     kv_write_batch_items[lane].transaction =
@@ -677,13 +727,13 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
             }
             LayerKvWriteBatch write_batch{
                 kv_write_batch_items.data(),
-                batch_size,
+                chunk_count,
                 impl_->host_kv_write_batch_items.data(),
                 device_kv_write_batch_items,
                 impl_->host_kv_write_batch_items.size(),
             };
             writeLayerBatch(write_batch);
-            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+            for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
                 if (!active[lane] || kv_write_batch_items[lane].status.ok()) {
                     continue;
                 }
@@ -708,19 +758,20 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
         auto attentionRequest = [&](std::uint32_t lane) {
             return PagedDecodeRequest{
                 layer,
-                query + static_cast<std::size_t>(lane)
+                query + static_cast<std::size_t>(chunk_offsets[lane])
                     * config.hidden_size,
-                attention + static_cast<std::size_t>(lane)
+                attention + static_cast<std::size_t>(chunk_offsets[lane])
                     * config.hidden_size,
-                attention_scores + static_cast<std::size_t>(lane)
+                attention_scores + static_cast<std::size_t>(chunk_offsets[lane])
                     * config.attention_head_count
                     * config.max_position_embeddings,
-                score_bytes_per_lane,
+                score_bytes_per_lane * chunk_counts[lane],
                 attention_scale,
+                chunk_counts[lane],
             };
         };
         if (attention_lane_count == 1) {
-            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+            for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
                 if (!active[lane]) {
                     continue;
                 }
@@ -738,7 +789,7 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
                 }
             }
         } else {
-            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+            for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
                 attention_batch_items[lane] = {};
                 if (active[lane]) {
                     attention_batch_items[lane].transaction =
@@ -749,13 +800,13 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
             }
             PagedDecodeBatch attention_batch{
                 attention_batch_items.data(),
-                batch_size,
+                chunk_count,
                 impl_->host_attention_batch_items.data(),
                 device_attention_batch_items,
                 impl_->host_attention_batch_items.size(),
             };
             attendLayerBatch(attention_batch);
-            for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+            for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
                 if (!active[lane]
                     || attention_batch_items[lane].status.ok()) {
                     continue;
@@ -872,7 +923,7 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
         return result;
     }
 
-    for (std::uint32_t lane = 0; lane < batch_size; ++lane) {
+    for (std::uint32_t lane = 0; lane < chunk_count; ++lane) {
         if (!active[lane]) {
             continue;
         }
@@ -886,7 +937,9 @@ GenerationBatchResult CudaTinyLlamaModelRunner::generationForwardBatch(
             continue;
         }
         result.steps[active_indices[lane]] = {
-            true, greedy_tokens[lane], {},
+            true,
+            greedy_tokens[chunk_offsets[lane] + chunk_counts[lane] - 1],
+            {},
         };
     }
     return result;

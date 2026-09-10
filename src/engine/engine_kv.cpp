@@ -83,19 +83,21 @@ TokenTransaction::TokenTransaction(
     RequestId request_id,
     std::uint32_t logical_token_position,
     std::uint32_t layer_count,
-    EngineStream stream) noexcept
+    EngineStream stream,
+    std::uint32_t token_count) noexcept
     : backend_(std::move(backend))
     , transaction_id_(transaction_id)
     , request_id_(request_id)
     , logical_token_position_(logical_token_position)
     , layer_count_(layer_count)
+    , token_count_(token_count)
     , phase_(TokenTransactionPhase::AwaitingLayerWrite)
     , stream_(stream)
 {
     if (backend_ == nullptr
         || transaction_id_ == kInvalidTokenTransactionId
         || request_id_ == kInvalidRequestId
-        || layer_count_ == 0) {
+        || layer_count_ == 0 || token_count_ == 0) {
         if (backend_ != nullptr) {
             backend_->rollback(stream_);
         }
@@ -116,6 +118,7 @@ TokenTransaction::TokenTransaction(TokenTransaction&& other) noexcept
     , logical_token_position_(other.logical_token_position_)
     , layer_count_(other.layer_count_)
     , next_layer_(other.next_layer_)
+    , token_count_(other.token_count_)
     , phase_(other.phase_)
     , stream_(other.stream_)
 {
@@ -137,6 +140,7 @@ TokenTransaction& TokenTransaction::operator=(
     logical_token_position_ = other.logical_token_position_;
     layer_count_ = other.layer_count_;
     next_layer_ = other.next_layer_;
+    token_count_ = other.token_count_;
     phase_ = other.phase_;
     stream_ = other.stream_;
 
@@ -175,6 +179,7 @@ TokenTransactionSnapshot TokenTransaction::snapshot() const noexcept
         layer_count_,
         next_layer_,
         phase_,
+        token_count_,
     };
 }
 
@@ -188,7 +193,8 @@ EngineKvStatus TokenTransaction::writeLayer(
         || write.layer != next_layer_) {
         return status(EngineKvError::LayerOutOfOrder);
     }
-    if (write.device_key == nullptr || write.device_value == nullptr) {
+    if (write.device_key == nullptr || write.device_value == nullptr
+        || write.token_count != token_count_) {
         return status(EngineKvError::InvalidArgument);
     }
 
@@ -216,7 +222,8 @@ EngineKvStatus TokenTransaction::attendLayer(
         || request.device_output == nullptr
         || request.device_workspace == nullptr
         || request.workspace_bytes == 0
-        || !(request.attention_scale > 0.0F)) {
+        || !(request.attention_scale > 0.0F)
+        || request.query_token_count != token_count_) {
         return status(EngineKvError::InvalidArgument);
     }
 
@@ -280,6 +287,7 @@ void TokenTransaction::resetMovedFrom() noexcept
     logical_token_position_ = 0;
     layer_count_ = 0;
     next_layer_ = 0;
+    token_count_ = 0;
     phase_ = TokenTransactionPhase::Empty;
     stream_ = nullptr;
 }
@@ -309,7 +317,8 @@ void writeLayerBatch(LayerKvWriteBatch& batch)
             || item.write.layer != transaction->next_layer_) {
             item.status = status(EngineKvError::LayerOutOfOrder);
         } else if (item.write.device_key == nullptr
-            || item.write.device_value == nullptr) {
+            || item.write.device_value == nullptr
+            || item.write.token_count != transaction->token_count_) {
             item.status = status(EngineKvError::InvalidArgument);
         } else {
             item.dispatched = true;
@@ -369,7 +378,9 @@ void attendLayerBatch(PagedDecodeBatch& batch)
             || item.request.device_output == nullptr
             || item.request.device_workspace == nullptr
             || item.request.workspace_bytes == 0
-            || !(item.request.attention_scale > 0.0F)) {
+            || !(item.request.attention_scale > 0.0F)
+            || item.request.query_token_count
+                != transaction->token_count_) {
             item.status = status(EngineKvError::InvalidArgument);
         } else {
             item.dispatched = true;

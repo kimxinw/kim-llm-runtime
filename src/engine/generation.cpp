@@ -47,6 +47,72 @@ GenerationBatchResult GenerationModelRunner::generationForwardBatch(
     return result;
 }
 
+GenerationBatchResult GenerationModelRunner::generationForwardChunks(
+    std::vector<GenerationChunkItem> const& chunks)
+{
+    GenerationBatchResult result;
+    if (chunks.empty()) {
+        result.detail = "generation chunk batch must not be empty";
+        return result;
+    }
+    try {
+        result.steps.resize(chunks.size());
+        std::vector<std::size_t> offsets(chunks.size(), 0);
+        std::size_t remaining = 0;
+        for (std::size_t index = 0; index < chunks.size(); ++index) {
+            if (chunks[index].token_ids.empty()) {
+                result.steps[index] = {
+                    false, 0, "generation chunk must not be empty",
+                };
+            } else {
+                ++remaining;
+            }
+        }
+        while (remaining != 0) {
+            std::vector<GenerationBatchItem> wave;
+            std::vector<std::size_t> wave_indices;
+            wave.reserve(remaining);
+            wave_indices.reserve(remaining);
+            for (std::size_t index = 0; index < chunks.size(); ++index) {
+                if (offsets[index] >= chunks[index].token_ids.size()) {
+                    continue;
+                }
+                wave.push_back(GenerationBatchItem{
+                    chunks[index].request_id,
+                    chunks[index].token_ids[offsets[index]],
+                    chunks[index].expected_position
+                        + static_cast<std::uint32_t>(offsets[index]),
+                });
+                wave_indices.push_back(index);
+            }
+            GenerationBatchResult wave_result = generationForwardBatch(wave);
+            if (!wave_result.success
+                || wave_result.steps.size() != wave.size()) {
+                result.steps.clear();
+                result.detail = wave_result.detail.empty()
+                    ? "generation chunk compatibility wave failed"
+                    : std::move(wave_result.detail);
+                return result;
+            }
+            for (std::size_t lane = 0; lane < wave_indices.size(); ++lane) {
+                std::size_t const index = wave_indices[lane];
+                result.steps[index] = std::move(wave_result.steps[lane]);
+                if (!result.steps[index].success
+                    || ++offsets[index] == chunks[index].token_ids.size()) {
+                    offsets[index] = chunks[index].token_ids.size();
+                    --remaining;
+                }
+            }
+        }
+    } catch (std::bad_alloc const&) {
+        result.steps.clear();
+        result.detail = "generation chunk result allocation failed";
+        return result;
+    }
+    result.success = true;
+    return result;
+}
+
 std::uint32_t GenerationModelRunner::generationMaxBatchSize() const noexcept
 {
     return std::numeric_limits<std::uint32_t>::max();

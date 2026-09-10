@@ -142,11 +142,12 @@ struct EngineBackendState final {
 
     [[nodiscard]] TokenReservationResult reserve(
         RequestId request_id,
-        std::uint32_t expected)
+        std::uint32_t expected,
+        std::uint32_t token_count)
     {
         return heterogeneous != nullptr
-            ? heterogeneous->reserveToken(request_id, expected)
-            : fixed->reserveToken(request_id, expected);
+            ? heterogeneous->reserveTokens(request_id, expected, token_count)
+            : fixed->reserveTokens(request_id, expected, token_count);
     }
 
     [[nodiscard]] KvCacheError commit(KvTokenReservationId id)
@@ -268,11 +269,13 @@ public:
         KvTokenReservationId reservation_id,
         RequestId request_id,
         PageLeaseId lease_id,
+        std::uint32_t token_count,
         std::unique_ptr<CudaEngineTransaction> io)
         : owner_(std::move(owner))
         , reservation_id_(reservation_id)
         , request_id_(request_id)
         , lease_id_(lease_id)
+        , token_count_(token_count)
         , io_(std::move(io))
     {
     }
@@ -302,6 +305,7 @@ public:
             );
             EngineStream const stream = batchStream(item);
             if (backend == nullptr || backend->owner_.get() != owner_.get()
+                || item.write.token_count != 1
                 || (cuda_count != 0 && stream != common_stream)
                 || cuda_count == kStackBatchCapacity) {
                 TokenTransactionBackend::writeLayerBatch(batch);
@@ -372,6 +376,7 @@ public:
             );
             EngineStream const stream = batchStream(item);
             if (backend == nullptr || backend->owner_.get() != owner_.get()
+                || item.request.query_token_count != 1
                 || (cuda_count != 0 && stream != common_stream)
                 || cuda_count == kStackBatchCapacity) {
                 TokenTransactionBackend::attendLayerBatch(batch);
@@ -436,10 +441,20 @@ public:
         if (length == owner_->committed_lengths.end()) {
             return {EngineKvError::InternalError};
         }
-        ++length->second;
+        std::uint32_t const previous_length = length->second;
+        length->second += token_count_;
         --owner_->active_transactions;
         resolved_ = true;
-        owner_->promoteCompletedRun(request_id_, length->second, stream);
+        std::uint64_t boundary =
+            (static_cast<std::uint64_t>(previous_length)
+                / kExtentPageTokenCapacity + 1)
+            * kExtentPageTokenCapacity;
+        while (boundary <= length->second) {
+            owner_->promoteCompletedRun(
+                request_id_, static_cast<std::uint32_t>(boundary), stream
+            );
+            boundary += kExtentPageTokenCapacity;
+        }
         return {};
     }
 
@@ -476,6 +491,7 @@ private:
     KvTokenReservationId reservation_id_{kInvalidKvTokenReservationId};
     RequestId request_id_{kInvalidRequestId};
     PageLeaseId lease_id_{kInvalidPageLeaseId};
+    std::uint32_t token_count_{0};
     std::unique_ptr<CudaEngineTransaction> io_;
     bool resolved_{false};
 };
@@ -559,7 +575,8 @@ public:
         auto const length = state_->committed_lengths.find(
             request.request_id
         );
-        if (request.request_id == kInvalidRequestId) {
+        if (request.request_id == kInvalidRequestId
+            || request.token_count == 0) {
             result.status = {EngineKvError::InvalidArgument};
             return result;
         }
@@ -569,7 +586,9 @@ public:
         }
 
         TokenReservationResult reservation = state_->reserve(
-            request.request_id, request.expected_committed_tokens
+            request.request_id,
+            request.expected_committed_tokens,
+            request.token_count
         );
         if (!reservation.ok()) {
             result.status = mapMetadata(reservation.error);
@@ -618,6 +637,7 @@ public:
                     reservation.reservation_id,
                     reservation.request_id,
                     lease_id,
+                    reservation.token_count,
                     std::move(io.transaction)
                 );
         } catch (...) {
@@ -639,7 +659,8 @@ public:
             reservation.request_id,
             reservation.logical_token_position,
             state_->config.kv_layout.layer_count,
-            request.stream
+            request.stream,
+            reservation.token_count
         );
         if (!result.transaction.valid()) {
             result.status = {EngineKvError::InternalError};

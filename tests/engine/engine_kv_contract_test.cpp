@@ -119,7 +119,8 @@ struct DeviceInputs final {
 [[nodiscard]] TokenTransaction makeTransaction(
     std::shared_ptr<TransactionTrace> const& trace,
     std::uint32_t layer_count = 3,
-    TokenTransactionId transaction_id = 7)
+    TokenTransactionId transaction_id = 7,
+    std::uint32_t token_count = 1)
 {
     return TokenTransaction(
         std::make_unique<FakeTransactionBackend>(trace),
@@ -127,8 +128,41 @@ struct DeviceInputs final {
         42,
         9,
         layer_count,
-        trace->expected_stream
+        trace->expected_stream,
+        token_count
     );
+}
+
+[[nodiscard]] LayerKvWrite makeWrite(
+    DeviceInputs const& inputs,
+    std::uint32_t layer);
+[[nodiscard]] PagedDecodeRequest makeAttention(
+    DeviceInputs& inputs,
+    std::uint32_t layer);
+
+void testMultiTokenTransactionContract()
+{
+    auto trace = std::make_shared<TransactionTrace>();
+    TokenTransaction transaction = makeTransaction(trace, 1, 91, 4);
+    DeviceInputs inputs;
+    expect(transaction.snapshot().token_count == 4,
+        "transaction snapshot exposes contiguous token count");
+    expect(transaction.writeLayer(makeWrite(inputs, 0)).error
+            == EngineKvError::InvalidArgument,
+        "multi-token transaction rejects scalar KV write");
+    LayerKvWrite write = makeWrite(inputs, 0);
+    write.token_count = 4;
+    expect(transaction.writeLayer(write).ok(),
+        "multi-token transaction accepts matching KV segment");
+    expect(transaction.attendLayer(makeAttention(inputs, 0)).error
+            == EngineKvError::InvalidArgument,
+        "multi-token transaction rejects scalar query count");
+    PagedDecodeRequest attention = makeAttention(inputs, 0);
+    attention.query_token_count = 4;
+    expect(transaction.attendLayer(attention).ok(),
+        "multi-token transaction accepts matching causal query segment");
+    expect(transaction.commit().ok(),
+        "multi-token transaction commits after every layer");
 }
 
 [[nodiscard]] LayerKvWrite makeWrite(
@@ -567,7 +601,8 @@ public:
             request.request_id,
             request.expected_committed_tokens,
             config().kv_layout.layer_count,
-            request.stream
+            request.stream,
+            request.token_count
         );
         ++snapshot_.active_transaction_count;
         return result;
@@ -625,6 +660,7 @@ int main()
 {
     testConfigurationAndDescriptorContract();
     testNormalLayerSequenceAndCommit();
+    testMultiTokenTransactionContract();
     testArgumentValidationDoesNotSubmit();
     testBatchedWriteAdvancesAndFailsLanesIndependently();
     testBatchedAttentionAdvancesAndFailsLanesIndependently();

@@ -132,6 +132,14 @@ struct GenerationBatchItem final {
     std::uint32_t expected_position{0};
 };
 
+// One request-local contiguous model segment. token_ids are laid out at
+// [expected_position, expected_position + token_ids.size()).
+struct GenerationChunkItem final {
+    RequestId request_id{kInvalidRequestId};
+    std::vector<std::uint32_t> token_ids{};
+    std::uint32_t expected_position{0};
+};
+
 struct GenerationBatchResult final {
     bool success{false};
     std::vector<GenerationStepResult> steps{};
@@ -162,6 +170,13 @@ public:
     // with request-local failures represented by the corresponding step.
     [[nodiscard]] virtual GenerationBatchResult generationForwardBatch(
         std::vector<GenerationBatchItem> const& batch
+    );
+
+    // Executes one or more request-local chunks with a shared total-token
+    // budget. The compatibility implementation advances each chunk through
+    // the scalar SPI; accelerated runners override this with true prefill.
+    [[nodiscard]] virtual GenerationBatchResult generationForwardChunks(
+        std::vector<GenerationChunkItem> const& chunks
     );
 
     [[nodiscard]] virtual std::uint32_t generationMaxBatchSize() const noexcept;

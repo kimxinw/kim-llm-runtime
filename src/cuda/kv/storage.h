@@ -12,7 +12,7 @@
 
 namespace kimkvcache {
 
-// Owns one Reserve -> per-layer Write/Attend -> token-boundary completion
+// Owns one segment Reserve -> per-layer Write/Attend -> atomic completion
 // sequence. Descriptor upload happens once at construction; layer calls only
 // enqueue work on the bound stream and never wait on the host.
 class CudaEngineTransaction final {

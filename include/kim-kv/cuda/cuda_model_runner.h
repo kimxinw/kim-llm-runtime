@@ -96,7 +96,7 @@ struct ModelRunnerOutputOptions final {
 
 struct CudaModelRunnerOptions final {
     // Workspace is allocated once at construction and never resized in the
-    // token path. Eight covers the c1/c2/c4 serving matrix with headroom.
+    // token path. This is the total flattened token-lane limit across chunks.
     std::uint32_t max_batch_size{8};
 
     [[nodiscard]] constexpr bool valid() const noexcept
@@ -145,6 +145,10 @@ public:
 
     [[nodiscard]] GenerationBatchResult generationForwardBatch(
         std::vector<GenerationBatchItem> const& batch
+    ) override;
+
+    [[nodiscard]] GenerationBatchResult generationForwardChunks(
+        std::vector<GenerationChunkItem> const& chunks
     ) override;
 
     [[nodiscard]] std::uint32_t generationMaxBatchSize() const noexcept override;

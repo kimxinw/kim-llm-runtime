@@ -1016,6 +1016,164 @@ void testBatchedAttentionFailureIsolation(EngineKvBackendKind kind)
     static_cast<void>(cudaStreamDestroy(stream));
 }
 
+void testMultiTokenCausalPrefill(EngineKvBackendKind kind)
+{
+    constexpr std::uint32_t kTokenCount = 10;
+    EngineKvConfig const config{KvLayout{1, 1, 2}, 2, 4096};
+    std::unique_ptr<EngineKvBackend> backend =
+        kind == EngineKvBackendKind::Heterogeneous
+        ? createHeterogeneousCudaEngineKvBackend(config, 16, 2)
+        : createFixedCudaEngineKvBackend(config, 8, 16);
+    expect(backend != nullptr, "create multi-token prefill backend");
+    expect(backend->createRequest(120).ok(),
+        "create multi-token prefill request");
+
+    cudaStream_t stream = nullptr;
+    KvScalar* key = nullptr;
+    KvScalar* value = nullptr;
+    KvScalar* query = nullptr;
+    KvScalar* output = nullptr;
+    float* scores = nullptr;
+    expect(cudaStreamCreate(&stream) == cudaSuccess,
+        "create multi-token prefill stream");
+    std::size_t const kv_elements = kTokenCount * 2;
+    std::size_t const query_elements = kTokenCount * 4;
+    std::size_t const score_elements = kTokenCount * 2 * kTokenCount;
+    expect(cudaMalloc(reinterpret_cast<void**>(&key),
+            kv_elements * sizeof(KvScalar)) == cudaSuccess,
+        "allocate multi-token keys");
+    expect(cudaMalloc(reinterpret_cast<void**>(&value),
+            kv_elements * sizeof(KvScalar)) == cudaSuccess,
+        "allocate multi-token values");
+    expect(cudaMalloc(reinterpret_cast<void**>(&query),
+            query_elements * sizeof(KvScalar)) == cudaSuccess,
+        "allocate multi-token queries");
+    expect(cudaMalloc(reinterpret_cast<void**>(&output),
+            query_elements * sizeof(KvScalar)) == cudaSuccess,
+        "allocate multi-token output");
+    expect(cudaMalloc(reinterpret_cast<void**>(&scores),
+            score_elements * sizeof(float)) == cudaSuccess,
+        "allocate multi-token score workspace");
+
+    std::vector<KvScalar> host_key(kv_elements, fp16(0.0F));
+    std::vector<KvScalar> host_value(kv_elements);
+    std::vector<KvScalar> host_query(query_elements, fp16(1.0F));
+    for (std::uint32_t token = 0; token < kTokenCount; ++token) {
+        host_value[token * 2] = fp16(static_cast<float>(token + 1));
+        host_value[token * 2 + 1] = fp16(
+            static_cast<float>((token + 1) * 2)
+        );
+    }
+    expect(cudaMemcpyAsync(key, host_key.data(),
+            kv_elements * sizeof(KvScalar), cudaMemcpyHostToDevice, stream)
+            == cudaSuccess,
+        "upload multi-token keys");
+    expect(cudaMemcpyAsync(value, host_value.data(),
+            kv_elements * sizeof(KvScalar), cudaMemcpyHostToDevice, stream)
+            == cudaSuccess,
+        "upload multi-token values");
+    expect(cudaMemcpyAsync(query, host_query.data(),
+            query_elements * sizeof(KvScalar), cudaMemcpyHostToDevice, stream)
+            == cudaSuccess,
+        "upload multi-token queries");
+
+    TokenReserveResult reserved = backend->reserveToken({
+        120, 0, reinterpret_cast<EngineStream>(stream), kTokenCount,
+    });
+    expect(reserved.ok()
+            && reserved.transaction.snapshot().token_count == kTokenCount,
+        "reserve one ten-token engine transaction");
+    expect(reserved.transaction.writeLayer({
+            0, key, value, kTokenCount}).ok(),
+        "write ten-token KV segment across page boundary");
+    expect(reserved.transaction.attendLayer({
+            0,
+            query,
+            output,
+            scores,
+            score_elements * sizeof(float),
+            1.0F / std::sqrt(2.0F),
+            kTokenCount,
+        }).ok(), "run causal paged prefill attention");
+    expect(reserved.transaction.commit().ok(),
+        "commit ten-token prefill atomically");
+
+    std::vector<KvScalar> host_output(query_elements);
+    expect(cudaMemcpy(host_output.data(), output,
+            query_elements * sizeof(KvScalar), cudaMemcpyDeviceToHost)
+            == cudaSuccess,
+        "download multi-token prefill output");
+    for (std::uint32_t token = 0; token < kTokenCount; ++token) {
+        float const expected_first = static_cast<float>(token + 2) / 2.0F;
+        for (std::uint32_t head = 0; head < 2; ++head) {
+            std::size_t const base = (token * 2 + head) * 2;
+            expect(std::abs(fp32(host_output[base]) - expected_first) < 0.02F
+                    && std::abs(fp32(host_output[base + 1])
+                        - expected_first * 2.0F) < 0.03F,
+                "each prefill query sees only its causal prefix");
+        }
+    }
+    expect(backend->snapshot().committed_token_count == kTokenCount,
+        "multi-token commit updates backend length once");
+    expect(backend->forkRequest(120, 121).ok(),
+        "fork multi-token history before partial-tail COW");
+    constexpr std::uint32_t kCowTokens = 3;
+    std::vector<KvScalar> cow_value(kCowTokens * 2);
+    for (std::uint32_t token = 0; token < kCowTokens; ++token) {
+        cow_value[token * 2] = fp16(100.0F);
+        cow_value[token * 2 + 1] = fp16(200.0F);
+    }
+    expect(cudaMemcpyAsync(value, cow_value.data(),
+            cow_value.size() * sizeof(KvScalar),
+            cudaMemcpyHostToDevice, stream) == cudaSuccess,
+        "upload chunk COW values");
+    TokenReserveResult cow = backend->reserveToken({
+        121, kTokenCount, reinterpret_cast<EngineStream>(stream), kCowTokens,
+    });
+    expect(cow.ok(), "reserve chunk on shared partial tail");
+    expect(cow.transaction.writeLayer({0, key, value, kCowTokens}).ok(),
+        "write chunk through partial-tail COW");
+    expect(cow.transaction.attendLayer({
+            0,
+            query,
+            output,
+            scores,
+            score_elements * sizeof(float),
+            1.0F / std::sqrt(2.0F),
+            kCowTokens,
+        }).ok(), "attend over copied history and new COW chunk");
+    expect(cow.transaction.commit().ok(), "commit chunk COW atomically");
+    std::vector<KvScalar> cow_output(kCowTokens * 4);
+    expect(cudaMemcpy(cow_output.data(), output,
+            cow_output.size() * sizeof(KvScalar), cudaMemcpyDeviceToHost)
+            == cudaSuccess,
+        "download chunk COW attention output");
+    for (std::uint32_t token = 0; token < kCowTokens; ++token) {
+        float const expected_first = (55.0F + 100.0F * (token + 1))
+            / static_cast<float>(11 + token);
+        for (std::uint32_t head = 0; head < 2; ++head) {
+            std::size_t const base = (token * 2 + head) * 2;
+            expect(std::abs(fp32(cow_output[base]) - expected_first) < 0.04F
+                    && std::abs(fp32(cow_output[base + 1])
+                        - expected_first * 2.0F) < 0.08F,
+                "chunk COW preserves history for causal attention");
+        }
+    }
+    expect(backend->releaseRequest(121).ok(),
+        "release chunk COW child request");
+    expect(backend->releaseRequest(120).ok(),
+        "release multi-token prefill request");
+    expect(backend->checkInvariants(),
+        "multi-token prefill preserves backend invariants");
+
+    static_cast<void>(cudaFree(scores));
+    static_cast<void>(cudaFree(output));
+    static_cast<void>(cudaFree(query));
+    static_cast<void>(cudaFree(value));
+    static_cast<void>(cudaFree(key));
+    static_cast<void>(cudaStreamDestroy(stream));
+}
+
 } // namespace
 
 int main()
@@ -1039,6 +1197,8 @@ int main()
         EngineKvBackendKind::Heterogeneous
     );
     testBatchedAttentionFailureIsolation(EngineKvBackendKind::Fixed);
+    testMultiTokenCausalPrefill(EngineKvBackendKind::Heterogeneous);
+    testMultiTokenCausalPrefill(EngineKvBackendKind::Fixed);
     if (failures != 0) {
         std::cerr << failures << " CUDA engine KV checks failed\n";
         return 1;

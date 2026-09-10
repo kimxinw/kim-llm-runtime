@@ -196,6 +196,59 @@ void testFixedReserveCommitRollback()
     expect(exhausted.checkInvariants(), "fixed OOM invariants");
 }
 
+void testContiguousMultiTokenReservations()
+{
+    KvCacheManager heterogeneous(8, 1);
+    expect(heterogeneous.createRequest(50) == KvCacheError::None,
+        "multi-token heterogeneous create");
+    TokenReservationResult multi = heterogeneous.reserveTokens(50, 0, 20);
+    expect(multi.ok() && multi.token_count == 20,
+        "heterogeneous reserves one contiguous token segment");
+    expect(multi.reserved.tokenCount() == 20
+        && multi.reserved.entries().size() == 3,
+        "heterogeneous segment spans three micro pages");
+    expect(heterogeneous.blockTable(50)->tokenCount() == 0,
+        "multi-token reservation remains invisible before commit");
+    expect(heterogeneous.checkInvariants(),
+        "multi-token heterogeneous reserve invariants");
+    expect(heterogeneous.commitTokenReservation(multi.reservation_id)
+            == KvCacheError::None,
+        "multi-token heterogeneous commit");
+    expect(heterogeneous.blockTable(50)->tokenCount() == 20,
+        "multi-token heterogeneous commit publishes atomically");
+
+    expect(heterogeneous.forkRequest(50, 51) == KvCacheError::None,
+        "fork seals partial tail for chunk COW");
+    std::uint32_t const pages_before =
+        heterogeneous.snapshot().micro_pool.allocated_slots;
+    multi = heterogeneous.reserveTokens(51, 20, 10);
+    expect(multi.ok() && multi.reserved.tokenCount() == 30
+        && multi.reserved.entries().size() == 4,
+        "chunk COW can fill the sealed tail and cross a page boundary");
+    expect(heterogeneous.rollbackTokenReservation(multi.reservation_id)
+            == KvCacheError::None,
+        "chunk COW rollback succeeds");
+    expect(heterogeneous.blockTable(51)->tokenCount() == 20
+        && heterogeneous.snapshot().micro_pool.allocated_slots == pages_before,
+        "chunk COW rollback restores mapping and page accounting");
+    expect(heterogeneous.checkInvariants(),
+        "chunk COW rollback invariants");
+
+    FixedPageManager fixed(8, 8);
+    expect(fixed.createRequest(60) == KvCacheError::None,
+        "multi-token fixed create");
+    multi = fixed.reserveTokens(60, 0, 19);
+    expect(multi.ok() && multi.reserved.tokenCount() == 19
+        && multi.reserved.entries().size() == 3,
+        "fixed backend reserves a cross-page token segment");
+    expect(fixed.commitTokenReservation(multi.reservation_id)
+            == KvCacheError::None,
+        "multi-token fixed commit");
+    expect(fixed.blockTable(60)->tokenCount() == 19
+        && fixed.checkInvariants(),
+        "multi-token fixed commit preserves invariants");
+}
+
 } // namespace
 
 int main()
@@ -203,6 +256,7 @@ int main()
     testHeterogeneousReserveCommitRollback();
     testHeterogeneousCowAndOom();
     testFixedReserveCommitRollback();
+    testContiguousMultiTokenReservations();
     if (failures != 0) {
         std::cerr << failures << " token reservation checks failed\n";
         return 1;

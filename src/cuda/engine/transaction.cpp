@@ -50,7 +50,9 @@ CudaStatus CudaEngineTransaction::Impl::prepareAttention(
         || request.device_query == nullptr
         || request.device_output == nullptr
         || request.device_workspace == nullptr
-        || !(request.attention_scale > 0.0F)) {
+        || !(request.attention_scale > 0.0F)
+        || request.query_token_count != 1
+        || reserved.tokenCount() != before.tokenCount() + 1) {
         return !submission_status.ok() ? submission_status : invalidArgument();
     }
     std::uint32_t const token_count = reserved.tokenCount();
@@ -145,7 +147,9 @@ CudaStatus CudaEngineTransaction::Impl::prepareWrite(
         || !submission_status.ok()
         || write.layer >= storage->layout.layer_count
         || write.device_key == nullptr
-        || write.device_value == nullptr) {
+        || write.device_value == nullptr
+        || write.token_count != 1
+        || reserved.tokenCount() != before.tokenCount() + 1) {
         return !submission_status.ok()
             ? submission_status
             : invalidArgument();
@@ -205,6 +209,72 @@ CudaStatus CudaEngineTransaction::writeLayer(
 {
     if (impl_ == nullptr) {
         return invalidArgument();
+    }
+    std::uint32_t const transaction_token_count =
+        impl_->reserved.tokenCount() - impl_->before.tokenCount();
+    if (write.token_count != transaction_token_count
+        || write.token_count == 0) {
+        return invalidArgument();
+    }
+    if (write.token_count > 1) {
+        if (impl_->finished || !impl_->submission_status.ok()
+            || write.layer >= impl_->storage->layout.layer_count
+            || write.device_key == nullptr || write.device_value == nullptr) {
+            return !impl_->submission_status.ok()
+                ? impl_->submission_status : invalidArgument();
+        }
+        if (impl_->storage->consumeFailure(CudaFailurePoint::Submission)) {
+            impl_->submission_status = injectedSubmissionFailure();
+            impl_->final_status = impl_->submission_status;
+            return impl_->submission_status;
+        }
+        if (!impl_->before.entries().empty()) {
+            MappingEntry const& old_tail = impl_->before.entries().back();
+            MappingEntry const& new_tail = impl_->reserved.entries()[
+                impl_->before.entries().size() - 1
+            ];
+            if (old_tail.logical_token_begin
+                    == new_tail.logical_token_begin
+                && old_tail.handle != new_tail.handle) {
+                KvScalar const* const source =
+                    impl_->storage->pagePointer(old_tail.handle);
+                KvScalar* const target =
+                    impl_->storage->pagePointer(new_tail.handle);
+                if (source == nullptr || target == nullptr) {
+                    return impl_->failSubmission(cudaErrorInvalidValue);
+                }
+                cuda_detail::launchCopyLayerTokens(
+                    source,
+                    impl_->storage->pageTokenCapacity(old_tail.kind),
+                    target,
+                    impl_->storage->pageTokenCapacity(new_tail.kind),
+                    old_tail.valid_tokens,
+                    write.layer,
+                    cuda_storage_detail::deviceLayout(
+                        impl_->storage->layout
+                    ),
+                    impl_->stream
+                );
+            }
+        }
+        cuda_detail::launchWriteLayerTokens(
+            impl_->device_descriptors,
+            impl_->descriptor_count,
+            impl_->storage->micro_data,
+            impl_->storage->micro_page_elements,
+            impl_->storage->extent_data,
+            impl_->storage->extent_page_elements,
+            impl_->before.tokenCount(),
+            write.token_count,
+            write.layer,
+            write.device_key,
+            write.device_value,
+            cuda_storage_detail::deviceLayout(impl_->storage->layout),
+            impl_->stream
+        );
+        cudaError_t const error = cudaGetLastError();
+        return error == cudaSuccess
+            ? CudaStatus{} : impl_->failSubmission(error);
     }
     DeviceLayerKvWriteBatchItem item;
     CudaStatus const prepared = impl_->prepareWrite(write, item);
@@ -328,6 +398,65 @@ CudaStatus CudaEngineTransaction::attendLayer(
 {
     if (impl_ == nullptr) {
         return invalidArgument();
+    }
+    std::uint32_t const transaction_token_count =
+        impl_->reserved.tokenCount() - impl_->before.tokenCount();
+    if (request.query_token_count != transaction_token_count
+        || request.query_token_count == 0) {
+        return invalidArgument();
+    }
+    if (request.query_token_count > 1) {
+        if (impl_->finished || !impl_->submission_status.ok()
+            || request.layer >= impl_->storage->layout.layer_count
+            || request.device_query == nullptr
+            || request.device_output == nullptr
+            || request.device_workspace == nullptr
+            || !(request.attention_scale > 0.0F)) {
+            return !impl_->submission_status.ok()
+                ? impl_->submission_status : invalidArgument();
+        }
+        std::size_t score_count = request.query_token_count;
+        if (score_count > std::numeric_limits<std::size_t>::max()
+                / impl_->query_head_count) {
+            return invalidArgument();
+        }
+        score_count *= impl_->query_head_count;
+        if (score_count > std::numeric_limits<std::size_t>::max()
+                / impl_->reserved.tokenCount()) {
+            return invalidArgument();
+        }
+        score_count *= impl_->reserved.tokenCount();
+        if (score_count > std::numeric_limits<std::size_t>::max()
+                / sizeof(float)
+            || request.workspace_bytes < score_count * sizeof(float)) {
+            return invalidArgument();
+        }
+        if (impl_->storage->consumeFailure(CudaFailurePoint::Submission)) {
+            impl_->submission_status = injectedSubmissionFailure();
+            impl_->final_status = impl_->submission_status;
+            return impl_->submission_status;
+        }
+        cuda_detail::launchPagedPrefillAttention(
+            impl_->device_descriptors,
+            impl_->descriptor_count,
+            impl_->storage->micro_data,
+            impl_->storage->micro_page_elements,
+            impl_->storage->extent_data,
+            impl_->storage->extent_page_elements,
+            impl_->reserved.tokenCount(),
+            request.query_token_count,
+            request.layer,
+            impl_->query_head_count,
+            request.device_query,
+            static_cast<float*>(request.device_workspace),
+            request.device_output,
+            request.attention_scale,
+            cuda_storage_detail::deviceLayout(impl_->storage->layout),
+            impl_->stream
+        );
+        cudaError_t const error = cudaGetLastError();
+        return error == cudaSuccess
+            ? CudaStatus{} : impl_->failSubmission(error);
     }
     DevicePagedDecodeBatchItem item;
     CudaStatus const prepared = impl_->prepareAttention(request, item);
@@ -463,7 +592,7 @@ CudaEngineTransactionBeginResult CudaKvStorage::beginEngineTransaction(
     }
     if (!impl_->validTable(before)
         || !impl_->validTable(reserved)
-        || reserved.tokenCount() != before.tokenCount() + 1
+        || reserved.tokenCount() <= before.tokenCount()
         || query_head_count < impl_->layout.kv_head_count
         || query_head_count % impl_->layout.kv_head_count != 0
         || reserved.entries().empty()) {

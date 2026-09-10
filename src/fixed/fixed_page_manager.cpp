@@ -710,39 +710,40 @@ bool FixedPageManager::checkInvariantsLocked() const
             || request_reservation->second != reservation_id
             || !transaction.candidate.checkInvariants(tokens_per_page_)
             || transaction.candidate.tokenCount()
-                != request_iterator->second.table.tokenCount() + 1
+                != request_iterator->second.table.tokenCount()
+                    + transaction.token_count
+            || transaction.token_count == 0
             || transaction.candidate.version()
                 != request_iterator->second.table.version() + 1) {
             return false;
         }
-        std::uint32_t const mode_count =
-            static_cast<std::uint32_t>(
-                transaction.staged_target.isStructurallyValid())
-            + static_cast<std::uint32_t>(
-                transaction.existing_mutable.isStructurallyValid());
-        if (mode_count != 1) {
+        if (transaction.staged_pages.empty()
+            && !transaction.existing_mutable.isStructurallyValid()) {
             return false;
         }
-        if (transaction.staged_target.isStructurallyValid()) {
-            RuntimeSlot const* target = runtimeSlotLocked(
-                transaction.staged_target
-            );
+        for (StagedPage const& staged : transaction.staged_pages) {
+            RuntimeSlot const* target = runtimeSlotLocked(staged.handle);
             if (target == nullptr
                 || target->state != PageState::CopyTarget
                 || target->ref_count != 0
-                || transaction.staged_target.slot >= expected_targets.size()
-                || expected_targets[transaction.staged_target.slot] != 0) {
+                || staged.entry_index >= transaction.candidate.entries().size()
+                || transaction.candidate.entries()[staged.entry_index].handle
+                    != staged.handle
+                || staged.handle.slot >= expected_targets.size()
+                || expected_targets[staged.handle.slot] != 0) {
                 return false;
             }
-            std::uint16_t const expected_tokens =
-                transaction.replaced_sealed_tail.isStructurallyValid()
-                ? static_cast<std::uint16_t>(
-                    transaction.candidate.entries().back().valid_tokens - 1)
-                : 0;
+            std::uint16_t expected_tokens = 0;
+            BlockTable const& before = request_iterator->second.table;
+            if (transaction.replaced_sealed_tail.isStructurallyValid()
+                && !before.entries().empty()
+                && staged.entry_index + 1 == before.entries().size()) {
+                expected_tokens = before.entries().back().valid_tokens;
+            }
             if (target->valid_tokens != expected_tokens) {
                 return false;
             }
-            expected_targets[transaction.staged_target.slot] = 1;
+            expected_targets[staged.handle.slot] = 1;
         }
         if (transaction.existing_mutable.isStructurallyValid()) {
             RuntimeSlot const* existing = runtimeSlotLocked(

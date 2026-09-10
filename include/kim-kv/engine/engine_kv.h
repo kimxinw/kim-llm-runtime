@@ -163,6 +163,7 @@ struct LayerKvWrite final {
     std::uint32_t layer{0};
     KvScalar const* device_key{nullptr};
     KvScalar const* device_value{nullptr};
+    std::uint32_t token_count{1};
 };
 
 class TokenTransaction;
@@ -217,6 +218,7 @@ struct PagedDecodeRequest final {
     void* device_workspace{nullptr};
     std::size_t workspace_bytes{0};
     float attention_scale{0.0F};
+    std::uint32_t query_token_count{1};
 };
 
 // One lane of a ragged paged-attention launch. The caller owns the transaction
@@ -267,6 +269,7 @@ struct ReserveTokenRequest final {
     RequestId request_id{kInvalidRequestId};
     std::uint32_t expected_committed_tokens{0};
     EngineStream stream{nullptr};
+    std::uint32_t token_count{1};
 };
 
 enum class TokenTransactionPhase : std::uint8_t {
@@ -309,6 +312,7 @@ struct TokenTransactionSnapshot final {
     std::uint32_t layer_count{0};
     std::uint32_t next_layer{0};
     TokenTransactionPhase phase{TokenTransactionPhase::Empty};
+    std::uint32_t token_count{0};
 };
 
 // Heterogeneous 与 Fixed 后端实现这个窄 SPI。write/attend 只提交到绑定的
@@ -366,7 +370,7 @@ protected:
     ) noexcept;
 };
 
-// 一个 Token 的 move-only RAII 事务。正常顺序固定为每层
+// 一个连续 Token 段的 move-only RAII 事务。正常顺序固定为每层
 // WriteLayer -> AttendLayer，全部层完成后才能 Commit。未 Commit 的对象在
 // 析构或被 move-assign 覆盖时自动 Rollback。
 class TokenTransaction final {
@@ -379,7 +383,8 @@ public:
         RequestId request_id,
         std::uint32_t logical_token_position,
         std::uint32_t layer_count,
-        EngineStream stream
+        EngineStream stream,
+        std::uint32_t token_count = 1
     ) noexcept;
 
     ~TokenTransaction();
@@ -417,6 +422,7 @@ private:
     std::uint32_t logical_token_position_{0};
     std::uint32_t layer_count_{0};
     std::uint32_t next_layer_{0};
+    std::uint32_t token_count_{0};
     TokenTransactionPhase phase_{TokenTransactionPhase::Empty};
     EngineStream stream_{nullptr};
 

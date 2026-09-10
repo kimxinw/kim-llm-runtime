@@ -91,6 +91,7 @@ public:
     std::unordered_set<RequestId> fail_requests{};
     std::unordered_map<RequestId, std::uint64_t> calls{};
     std::vector<std::size_t> batch_sizes{};
+    std::vector<std::vector<std::size_t>> chunk_sizes{};
     IterationSchedulerRuntime* stop_scheduler{nullptr};
     RequestId stop_request{kInvalidRequestId};
 
@@ -125,6 +126,18 @@ public:
     {
         batch_sizes.push_back(batch.size());
         return GenerationModelRunner::generationForwardBatch(batch);
+    }
+
+    [[nodiscard]] GenerationBatchResult generationForwardChunks(
+        std::vector<GenerationChunkItem> const& chunks) override
+    {
+        std::vector<std::size_t> sizes;
+        sizes.reserve(chunks.size());
+        for (GenerationChunkItem const& chunk : chunks) {
+            sizes.push_back(chunk.token_ids.size());
+        }
+        chunk_sizes.push_back(std::move(sizes));
+        return GenerationModelRunner::generationForwardChunks(chunks);
     }
 };
 
@@ -277,8 +290,8 @@ void testChunkedPrefillBudgetAndBatchAccounting()
 
     SchedulerIterationResult first = scheduler.runIteration();
     expect(first.model_forward_tokens == 6
-        && first.model_forward_batches == 3,
-        "chunked prefill consumes three two-request model batches");
+        && first.model_forward_batches == 1,
+        "chunked prefill consumes one multi-token model batch");
     expect(first.prefill_tokens == 6 && first.decode_tokens == 0,
         "chunked prefill accounts prompt positions separately");
     expect(runner.calls[40] == 3 && runner.calls[41] == 3,
@@ -288,6 +301,9 @@ void testChunkedPrefillBudgetAndBatchAccounting()
             runner.batch_sizes.begin(), runner.batch_sizes.end(),
             [](std::size_t size) { return size == 2; }
         ), "each prefill wave is a real two-request model batch");
+    expect(!runner.chunk_sizes.empty()
+        && runner.chunk_sizes.front() == std::vector<std::size_t>({3, 3}),
+        "scheduler submits one three-token chunk per request");
 
     std::vector<GenerationTerminal> terminals = scheduler.drain();
     expect(terminals.size() == 2
@@ -301,7 +317,7 @@ void testChunkedPrefillBudgetAndBatchAccounting()
     expect(snapshot.prefill_tokens == 10 && snapshot.decode_tokens == 2,
         "snapshot separates all prefill and decode work");
     expect(snapshot.model_forward_tokens == 12
-        && snapshot.model_forward_batches == 6,
+        && snapshot.model_forward_batches == 3,
         "snapshot exposes cumulative batch utilization");
     expectReclaimed(backend, scheduler, "chunked prefill");
 }

@@ -198,10 +198,11 @@ public:
         }
     }
 
-    [[nodiscard]] bool prepareOne(
+    [[nodiscard]] bool prepareChunk(
         Record& record,
-        GenerationBatchItem& item,
-        bool& prefill)
+        std::uint32_t max_tokens,
+        GenerationChunkItem& item,
+        std::uint32_t& prefill_token_count)
     {
         if (record.cancel_requested
             || (record.request.cancellation != nullptr
@@ -241,31 +242,45 @@ public:
             }
         }
 
-        prefill = record.prompt_position
+        bool const prefill = record.prompt_position
             < record.request.prompt_token_ids.size();
-        std::uint32_t token = 0;
         std::uint32_t position = 0;
+        std::vector<std::uint32_t> tokens;
         if (prefill) {
             position = record.prompt_position;
-            token = record.request.prompt_token_ids[position];
+            std::uint32_t const remaining = static_cast<std::uint32_t>(
+                record.request.prompt_token_ids.size()
+            ) - position;
+            prefill_token_count = std::min({
+                remaining, config.prefill_chunk_size, max_tokens,
+            });
+            if (prefill_token_count == 0) {
+                return false;
+            }
+            tokens.assign(
+                record.request.prompt_token_ids.begin() + position,
+                record.request.prompt_token_ids.begin()
+                    + position + prefill_token_count
+            );
         } else {
+            prefill_token_count = 0;
             position = record.terminal.usage.prompt_tokens
                 + static_cast<std::uint32_t>(
                     record.terminal.output_token_ids.size()
                 ) - 1;
-            token = record.terminal.output_token_ids.back();
+            tokens.push_back(record.terminal.output_token_ids.back());
         }
 
-        item = GenerationBatchItem{
-            record.request.request_id, token, position,
+        item = GenerationChunkItem{
+            record.request.request_id, std::move(tokens), position,
         };
         return true;
     }
 
-    void applyOne(
+    void applyChunk(
         Record& record,
         GenerationStepResult step,
-        bool prefill)
+        std::uint32_t prefill_token_count)
     {
         if (!step.success) {
             finish(
@@ -286,9 +301,7 @@ public:
             );
             return;
         }
-        if (prefill) {
-            ++record.prompt_position;
-        }
+        record.prompt_position += prefill_token_count;
 
         if (stopped.load(std::memory_order_acquire)) {
             stopRecord(record);
@@ -493,20 +506,16 @@ SchedulerIterationResult IterationSchedulerRuntime::runIteration()
         return result;
     }
 
-    struct ScheduledRequest final {
-        Impl::Record* record{nullptr};
-        std::uint32_t remaining_steps{0};
-    };
     struct PlannedStep final {
         Impl::Record* record{nullptr};
-        GenerationBatchItem item{};
-        bool prefill{false};
+        GenerationChunkItem item{};
+        std::uint32_t prefill_token_count{0};
     };
 
     std::size_t const scheduled = std::min<std::size_t>(
         impl_->schedule_queue.size(), impl_->config.max_batched_tokens
     );
-    std::vector<ScheduledRequest> selected;
+    std::vector<Impl::Record*> selected;
     try {
         selected.reserve(scheduled);
         for (std::size_t index = 0; index < scheduled; ++index) {
@@ -518,22 +527,13 @@ SchedulerIterationResult IterationSchedulerRuntime::runIteration()
                 continue;
             }
             Impl::Record& record = found->second;
-            std::uint32_t const prompt_remaining =
-                static_cast<std::uint32_t>(
-                    record.request.prompt_token_ids.size()
-                ) - record.prompt_position;
-            std::uint32_t const quota = prompt_remaining == 0
-                ? 1
-                : std::min(
-                    prompt_remaining, impl_->config.prefill_chunk_size
-                );
-            selected.push_back(ScheduledRequest{&record, quota});
+            selected.push_back(&record);
         }
     } catch (std::bad_alloc const&) {
-        for (ScheduledRequest const& request : selected) {
-            if (request.record->state != SchedulerRequestState::Terminal) {
+        for (Impl::Record* record : selected) {
+            if (record->state != SchedulerRequestState::Terminal) {
                 impl_->finish(
-                    *request.record,
+                    *record,
                     GenerationTerminalReason::Failed,
                     GenerationError::InternalError,
                     "scheduler batch planning allocation failed"
@@ -546,10 +546,10 @@ SchedulerIterationResult IterationSchedulerRuntime::runIteration()
     std::uint32_t const runner_batch_size =
         impl_->runner->generationMaxBatchSize();
     if (runner_batch_size == 0) {
-        for (ScheduledRequest const& request : selected) {
-            if (request.record->state != SchedulerRequestState::Terminal) {
+        for (Impl::Record* record : selected) {
+            if (record->state != SchedulerRequestState::Terminal) {
                 impl_->finish(
-                    *request.record,
+                    *record,
                     GenerationTerminalReason::Failed,
                     GenerationError::ModelFailed,
                     "model runner reported a zero maximum batch size"
@@ -557,112 +557,117 @@ SchedulerIterationResult IterationSchedulerRuntime::runIteration()
             }
         }
     }
-    while (remaining_budget != 0 && runner_batch_size != 0) {
-        std::vector<PlannedStep> plan;
-        try {
-            plan.reserve(std::min<std::size_t>(
-                selected.size(), remaining_budget
-            ));
-            for (ScheduledRequest& request : selected) {
-                if (request.remaining_steps == 0 || remaining_budget == 0
-                    || request.record->state
-                        == SchedulerRequestState::Terminal) {
-                    continue;
-                }
-                GenerationBatchItem item;
-                bool prefill = false;
-                if (impl_->prepareOne(*request.record, item, prefill)) {
-                    plan.push_back(PlannedStep{
-                        request.record, item, prefill,
-                    });
-                    --request.remaining_steps;
-                    --remaining_budget;
-                } else {
-                    request.remaining_steps = 0;
-                }
-            }
-        } catch (std::bad_alloc const&) {
-            for (ScheduledRequest const& request : selected) {
-                if (request.record->state != SchedulerRequestState::Terminal) {
-                    impl_->finish(
-                        *request.record,
-                        GenerationTerminalReason::Failed,
-                        GenerationError::InternalError,
-                        "scheduler model batch allocation failed"
-                    );
-                }
-            }
-            break;
-        }
-        if (plan.empty()) {
-            break;
-        }
-
-        for (std::size_t begin = 0; begin < plan.size();
-             begin += runner_batch_size) {
-            std::size_t const end = std::min<std::size_t>(
-                plan.size(), begin + runner_batch_size
-            );
-            std::vector<GenerationBatchItem> batch;
-            try {
-                batch.reserve(end - begin);
-                for (std::size_t index = begin; index < end; ++index) {
-                    batch.push_back(plan[index].item);
-                }
-            } catch (std::bad_alloc const&) {
-                for (std::size_t index = begin; index < end; ++index) {
-                    impl_->finish(
-                        *plan[index].record,
-                        GenerationTerminalReason::Failed,
-                        GenerationError::InternalError,
-                        "scheduler model batch allocation failed"
-                    );
-                }
+    std::vector<PlannedStep> plan;
+    try {
+        plan.reserve(selected.size());
+        std::size_t remaining_candidates = selected.size();
+        for (Impl::Record* record : selected) {
+            if (remaining_budget == 0
+                || record->state == SchedulerRequestState::Terminal) {
+                --remaining_candidates;
                 continue;
             }
-
-            GenerationBatchResult batch_result =
-                impl_->runner->generationForwardBatch(batch);
-            ++result.model_forward_batches;
-            result.model_forward_tokens += static_cast<std::uint32_t>(
-                batch.size()
+            GenerationChunkItem item;
+            std::uint32_t prefill_token_count = 0;
+            std::uint32_t const reserved_for_rest =
+                static_cast<std::uint32_t>(remaining_candidates - 1);
+            std::uint32_t const fair_budget = remaining_budget
+                > reserved_for_rest
+                ? remaining_budget - reserved_for_rest : 1;
+            std::uint32_t const chunk_limit = std::min(
+                fair_budget, runner_batch_size
             );
-            for (std::size_t index = begin; index < end; ++index) {
-                if (plan[index].prefill) {
-                    ++result.prefill_tokens;
-                } else {
-                    ++result.decode_tokens;
-                }
+            if (impl_->prepareChunk(
+                    *record, chunk_limit, item, prefill_token_count)) {
+                std::uint32_t const token_count = static_cast<std::uint32_t>(
+                    item.token_ids.size()
+                );
+                plan.push_back(PlannedStep{
+                    record, std::move(item), prefill_token_count,
+                });
+                remaining_budget -= token_count;
             }
-            if (!batch_result.success
-                || batch_result.steps.size() != batch.size()) {
-                std::string detail = batch_result.detail.empty()
-                    ? "model returned an invalid batch result"
-                    : std::move(batch_result.detail);
-                for (std::size_t index = begin; index < end; ++index) {
-                    impl_->finish(
-                        *plan[index].record,
-                        GenerationTerminalReason::Failed,
-                        GenerationError::ModelFailed,
-                        detail
-                    );
-                }
-            } else {
-                for (std::size_t index = begin; index < end; ++index) {
-                    impl_->applyOne(
-                        *plan[index].record,
-                        std::move(batch_result.steps[index - begin]),
-                        plan[index].prefill
-                    );
-                }
+            --remaining_candidates;
+        }
+    } catch (std::bad_alloc const&) {
+        for (Impl::Record* record : selected) {
+            if (record->state != SchedulerRequestState::Terminal) {
+                impl_->finish(
+                    *record,
+                    GenerationTerminalReason::Failed,
+                    GenerationError::InternalError,
+                    "scheduler model chunk allocation failed"
+                );
             }
-            if (stopped()) {
+        }
+    }
+
+    for (std::size_t begin = 0; begin < plan.size() && !stopped();) {
+        std::size_t end = begin;
+        std::uint32_t batch_tokens = 0;
+        while (end < plan.size()) {
+            std::uint32_t const chunk_tokens = static_cast<std::uint32_t>(
+                plan[end].item.token_ids.size()
+            );
+            if (batch_tokens != 0
+                && chunk_tokens > runner_batch_size - batch_tokens) {
                 break;
             }
+            batch_tokens += chunk_tokens;
+            ++end;
         }
-        if (stopped()) {
-            break;
+        std::vector<GenerationChunkItem> batch;
+        try {
+            batch.reserve(end - begin);
+            for (std::size_t index = begin; index < end; ++index) {
+                batch.push_back(plan[index].item);
+            }
+        } catch (std::bad_alloc const&) {
+            for (std::size_t index = begin; index < end; ++index) {
+                impl_->finish(
+                    *plan[index].record,
+                    GenerationTerminalReason::Failed,
+                    GenerationError::InternalError,
+                    "scheduler model chunk batch allocation failed"
+                );
+            }
+            begin = end;
+            continue;
         }
+
+        GenerationBatchResult batch_result =
+            impl_->runner->generationForwardChunks(batch);
+        ++result.model_forward_batches;
+        result.model_forward_tokens += batch_tokens;
+        for (std::size_t index = begin; index < end; ++index) {
+            result.prefill_tokens += plan[index].prefill_token_count;
+            if (plan[index].prefill_token_count == 0) {
+                ++result.decode_tokens;
+            }
+        }
+        if (!batch_result.success
+            || batch_result.steps.size() != batch.size()) {
+            std::string detail = batch_result.detail.empty()
+                ? "model returned an invalid chunk batch result"
+                : std::move(batch_result.detail);
+            for (std::size_t index = begin; index < end; ++index) {
+                impl_->finish(
+                    *plan[index].record,
+                    GenerationTerminalReason::Failed,
+                    GenerationError::ModelFailed,
+                    detail
+                );
+            }
+        } else {
+            for (std::size_t index = begin; index < end; ++index) {
+                impl_->applyChunk(
+                    *plan[index].record,
+                    std::move(batch_result.steps[index - begin]),
+                    plan[index].prefill_token_count
+                );
+            }
+        }
+        begin = end;
     }
 
     impl_->model_forward_tokens += result.model_forward_tokens;
@@ -670,13 +675,13 @@ SchedulerIterationResult IterationSchedulerRuntime::runIteration()
     impl_->prefill_tokens += result.prefill_tokens;
     impl_->decode_tokens += result.decode_tokens;
 
-    for (ScheduledRequest const& request : selected) {
-        if (request.record->state != SchedulerRequestState::Terminal) {
+    for (Impl::Record* record : selected) {
+        if (record->state != SchedulerRequestState::Terminal) {
             if (stopped()) {
-                impl_->stopRecord(*request.record);
+                impl_->stopRecord(*record);
             } else {
                 impl_->schedule_queue.push_back(
-                    request.record->request.request_id
+                    record->request.request_id
                 );
             }
         }
