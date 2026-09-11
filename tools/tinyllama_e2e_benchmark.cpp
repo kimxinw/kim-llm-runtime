@@ -5,6 +5,10 @@
 
 #include <cuda_runtime_api.h>
 
+#if defined(KIM_KV_HAS_NVTX)
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -43,6 +47,8 @@ struct Options final {
     std::string output{};
     std::string git_commit{"unknown"};
     Variant variant{Variant::Heterogeneous};
+    std::optional<std::string> case_name{};
+    bool profile{false};
     std::uint32_t warmup{1};
     std::uint32_t iterations{3};
     std::uint32_t kv_capacity_tokens{8192};
@@ -56,6 +62,16 @@ struct CaseSpec final {
     std::uint32_t output_length{32};
     bool fault{false};
     bool capacity{false};
+};
+
+struct CaseSelection final {
+    std::vector<CaseSpec> performance{};
+    bool capacity{false};
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return performance.empty() && !capacity;
+    }
 };
 
 struct RequestEvidence final {
@@ -135,6 +151,133 @@ struct SuiteContext final {
     std::uint32_t capacity_tokens{0};
 };
 
+class NvtxRange final {
+public:
+    NvtxRange(bool enabled, std::string const& name) noexcept
+        : active_(enabled)
+    {
+#if defined(KIM_KV_HAS_NVTX)
+        if (active_) {
+            static_cast<void>(nvtxRangePushA(name.c_str()));
+        }
+#else
+        static_cast<void>(name);
+#endif
+    }
+
+    ~NvtxRange()
+    {
+#if defined(KIM_KV_HAS_NVTX)
+        if (active_) {
+            static_cast<void>(nvtxRangePop());
+        }
+#endif
+    }
+
+    NvtxRange(NvtxRange const&) = delete;
+    NvtxRange& operator=(NvtxRange const&) = delete;
+
+private:
+    bool active_{false};
+};
+
+class ProfilingModelRunner final : public GenerationModelRunner {
+public:
+    ProfilingModelRunner(
+        GenerationModelRunner& delegate,
+        std::map<RequestId, std::uint32_t> prompt_lengths)
+        : delegate_(&delegate), prompt_lengths_(std::move(prompt_lengths))
+    {
+    }
+
+    [[nodiscard]] TinyLlamaConfig generationConfig() const noexcept override
+    {
+        return delegate_->generationConfig();
+    }
+
+    [[nodiscard]] GenerationStepResult generationForwardToken(
+        RequestId request_id,
+        std::uint32_t token_id,
+        std::uint32_t expected_position) override
+    {
+        NvtxRange const range(
+            true, phaseName({{request_id, expected_position}})
+        );
+        return delegate_->generationForwardToken(
+            request_id, token_id, expected_position
+        );
+    }
+
+    [[nodiscard]] GenerationBatchResult generationForwardBatch(
+        std::vector<GenerationBatchItem> const& batch) override
+    {
+        std::vector<RequestPosition> positions;
+        positions.reserve(batch.size());
+        for (GenerationBatchItem const& item : batch) {
+            positions.push_back({item.request_id, item.expected_position});
+        }
+        NvtxRange const range(true, phaseName(positions));
+        return delegate_->generationForwardBatch(batch);
+    }
+
+    [[nodiscard]] GenerationBatchResult generationForwardChunks(
+        std::vector<GenerationChunkItem> const& chunks) override
+    {
+        std::vector<RequestPosition> positions;
+        positions.reserve(chunks.size());
+        for (GenerationChunkItem const& item : chunks) {
+            positions.push_back({item.request_id, item.expected_position});
+        }
+        NvtxRange const range(true, phaseName(positions));
+        return delegate_->generationForwardChunks(chunks);
+    }
+
+    [[nodiscard]] std::uint32_t generationMaxBatchSize() const noexcept override
+    {
+        return delegate_->generationMaxBatchSize();
+    }
+
+private:
+    struct RequestPosition final {
+        RequestId request_id{kInvalidRequestId};
+        std::uint32_t expected_position{0};
+    };
+
+    [[nodiscard]] std::string phaseName(
+        std::vector<RequestPosition> const& positions) const
+    {
+        bool has_prefill = false;
+        bool has_decode = false;
+        bool has_unknown = false;
+        for (RequestPosition const& position : positions) {
+            auto const found = prompt_lengths_.find(position.request_id);
+            if (found == prompt_lengths_.end()) {
+                has_unknown = true;
+            } else if (position.expected_position < found->second) {
+                has_prefill = true;
+            } else {
+                has_decode = true;
+            }
+        }
+        if (has_unknown) {
+            return "unclassified";
+        }
+        if (has_prefill && has_decode) {
+            return "mixed";
+        }
+        if (has_prefill) {
+            return "prefill";
+        }
+        if (has_decode) {
+            return "decode";
+        }
+        return "empty";
+    }
+
+    GenerationModelRunner* delegate_{nullptr};
+    std::map<RequestId, std::uint32_t> prompt_lengths_{};
+};
+
 [[nodiscard]] std::string_view variantName(Variant variant) noexcept
 {
     switch (variant) {
@@ -203,11 +346,16 @@ struct SuiteContext final {
 
 [[nodiscard]] bool parseOptions(int argc, char** argv, Options& options)
 {
-    for (int index = 1; index < argc; index += 2) {
+    for (int index = 1; index < argc;) {
+        std::string const key = argv[index];
+        if (key == "--profile") {
+            options.profile = true;
+            ++index;
+            continue;
+        }
         if (index + 1 >= argc) {
             return false;
         }
-        std::string const key = argv[index];
         std::string const value = argv[index + 1];
         if (key == "--manifest") {
             options.manifest = value;
@@ -223,6 +371,11 @@ struct SuiteContext final {
                 return false;
             }
             options.variant = *parsed;
+        } else if (key == "--case") {
+            if (value.empty()) {
+                return false;
+            }
+            options.case_name = value;
         } else if (key == "--warmup") {
             if (!parseUnsigned(value, options.warmup)) {
                 return false;
@@ -242,9 +395,16 @@ struct SuiteContext final {
         } else {
             return false;
         }
+        index += 2;
     }
+    bool const valid_iterations = options.profile
+        ? options.iterations >= 1
+        : options.iterations >= 3;
+    bool const valid_profile_selection =
+        !options.profile || options.case_name.has_value();
     return !options.manifest.empty() && !options.weights.empty()
-        && !options.output.empty() && options.iterations >= 3
+        && !options.output.empty() && valid_iterations
+        && valid_profile_selection
         && options.kv_capacity_tokens >= 128
         && options.kv_capacity_tokens % 128 == 0
         && options.capacity_probe_tokens >= 128
@@ -333,6 +493,20 @@ struct SuiteContext final {
         false,
         true,
     };
+}
+
+[[nodiscard]] CaseSelection selectCases(
+    std::optional<std::string> const& selected_case)
+{
+    CaseSelection result;
+    for (CaseSpec& spec : performanceCases()) {
+        if (!selected_case.has_value() || spec.name == *selected_case) {
+            result.performance.push_back(std::move(spec));
+        }
+    }
+    result.capacity = !selected_case.has_value()
+        || *selected_case == "capacity";
+    return result;
 }
 
 [[nodiscard]] std::unique_ptr<EngineKvBackend> createBackend(
@@ -433,13 +607,27 @@ void destroyContext(SuiteContext& context) noexcept
     CaseSpec const& spec,
     std::uint64_t id_base,
     bool collect_resources,
-    ResourceProbe* resource_probe)
+    ResourceProbe* resource_probe,
+    bool profile)
 {
     RunEvidence result;
     TinyLlamaConfig const config = context.model.runner->generationConfig();
+    std::map<RequestId, std::uint32_t> prompt_lengths;
+    for (std::uint32_t index = 0; index < spec.concurrency; ++index) {
+        prompt_lengths.emplace(
+            id_base + index + 1,
+            spec.prompt_lengths[index % spec.prompt_lengths.size()]
+        );
+    }
+    ProfilingModelRunner profiling_runner(
+        *context.model.runner, std::move(prompt_lengths)
+    );
+    GenerationModelRunner& scheduler_runner = profile
+        ? static_cast<GenerationModelRunner&>(profiling_runner)
+        : static_cast<GenerationModelRunner&>(*context.model.runner);
     IterationSchedulerRuntime scheduler(
         *context.backend,
-        *context.model.runner,
+        scheduler_runner,
         IterationSchedulerConfig{
             spec.concurrency,
             spec.concurrency * 16,
@@ -683,28 +871,38 @@ void summarize(CaseEvidence& result)
     CaseSpec spec,
     std::uint32_t warmup,
     std::uint32_t iterations,
-    std::uint64_t id_namespace)
+    std::uint64_t id_namespace,
+    bool profile)
 {
+    NvtxRange const case_range(profile, "case/" + spec.name);
     for (std::uint32_t index = 0; index < warmup; ++index) {
+        NvtxRange const warmup_range(
+            profile, "warmup/" + std::to_string(index)
+        );
         static_cast<void>(runOnce(
             context,
             spec,
             id_namespace + static_cast<std::uint64_t>(index) * 10'000,
             false,
-            nullptr
+            nullptr,
+            profile
         ));
     }
 
     CaseEvidence result;
     result.spec = std::move(spec);
     for (std::uint32_t index = 0; index < iterations; ++index) {
+        NvtxRange const iteration_range(
+            profile, "iteration/" + std::to_string(index)
+        );
         result.runs.push_back(runOnce(
             context,
             result.spec,
             id_namespace + 1'000'000
                 + static_cast<std::uint64_t>(index) * 10'000,
             false,
-            nullptr
+            nullptr,
+            profile
         ));
     }
     RunEvidence const reference = result.runs.front();
@@ -718,13 +916,16 @@ void summarize(CaseEvidence& result)
             result.runs.begin(), result.runs.end(),
             [](RunEvidence const& run) { return run.expected_outcome; }
         );
-    static_cast<void>(runOnce(
-        context,
-        result.spec,
-        id_namespace + 9'000'000,
-        true,
-        &result.resources
-    ));
+    if (!profile) {
+        static_cast<void>(runOnce(
+            context,
+            result.spec,
+            id_namespace + 9'000'000,
+            true,
+            &result.resources,
+            false
+        ));
+    }
     summarize(result);
     return result;
 }
@@ -878,7 +1079,18 @@ int main(int argc, char** argv)
         return fail("usage: --manifest PATH --weights PATH --variant "
             "hetero|fixed_8|fixed_16|fixed_32|fixed_64 --output PATH "
             "[--warmup N] --iterations N>=3 [--git-commit SHA] "
-            "[--kv-capacity-tokens N] [--capacity-probe-tokens N]");
+            "[--kv-capacity-tokens N] [--capacity-probe-tokens N] "
+            "[--case NAME] [--profile (allows iterations>=1 and "
+            "requires --case)]");
+    }
+#if !defined(KIM_KV_HAS_NVTX)
+    if (options.profile) {
+        return fail("--profile requires an NVTX-enabled build");
+    }
+#endif
+    CaseSelection const selection = selectCases(options.case_name);
+    if (selection.empty()) {
+        return fail("unknown case: " + *options.case_name);
     }
     WeightManifestLoadResult loaded = loadWeightManifest(options.manifest);
     if (!loaded.ok()) {
@@ -892,55 +1104,71 @@ int main(int argc, char** argv)
     int runtime_version = 0;
     static_cast<void>(cudaRuntimeGetVersion(&runtime_version));
 
-    SuiteContext performance;
     std::string error;
-    if (!initializeContext(
-            options,
-            loaded.manifest,
-            options.kv_capacity_tokens,
-            performance,
-            error)) {
-        destroyContext(performance);
-        return fail(error);
-    }
     std::vector<CaseEvidence> cases;
     std::uint64_t id_namespace = 100'000'000;
-    for (CaseSpec const& spec : performanceCases()) {
-        cases.push_back(runCase(
-            performance,
-            spec,
-            spec.fault ? 0 : options.warmup,
-            options.iterations,
-            id_namespace
-        ));
-        id_namespace += 20'000'000;
-    }
-    std::uint64_t const performance_storage_bytes =
-        performance.storage_bytes;
-    std::uint64_t const weight_bytes = performance.weight_bytes;
-    std::uint64_t const workspace_bytes = performance.workspace_bytes;
-    std::uint64_t const loaded_gpu_bytes = performance.loaded_gpu_bytes;
-    destroyContext(performance);
+    std::uint64_t performance_storage_bytes = 0;
+    std::uint64_t capacity_storage_bytes = 0;
+    std::uint64_t weight_bytes = 0;
+    std::uint64_t workspace_bytes = 0;
+    std::uint64_t loaded_gpu_bytes = 0;
 
-    SuiteContext capacity;
-    if (!initializeContext(
-            options,
-            loaded.manifest,
-            options.capacity_probe_tokens,
-            capacity,
-            error)) {
-        destroyContext(capacity);
-        return fail(error);
+    if (!selection.performance.empty()) {
+        SuiteContext performance;
+        if (!initializeContext(
+                options,
+                loaded.manifest,
+                options.kv_capacity_tokens,
+                performance,
+                error)) {
+            destroyContext(performance);
+            return fail(error);
+        }
+        for (CaseSpec const& spec : selection.performance) {
+            cases.push_back(runCase(
+                performance,
+                spec,
+                spec.fault ? 0 : options.warmup,
+                options.iterations,
+                id_namespace,
+                options.profile
+            ));
+            id_namespace += 20'000'000;
+        }
+        performance_storage_bytes = performance.storage_bytes;
+        weight_bytes = performance.weight_bytes;
+        workspace_bytes = performance.workspace_bytes;
+        loaded_gpu_bytes = performance.loaded_gpu_bytes;
+        destroyContext(performance);
     }
-    cases.push_back(runCase(
-        capacity,
-        capacityCase(options.capacity_probe_tokens),
-        0,
-        options.iterations,
-        id_namespace
-    ));
-    std::uint64_t const capacity_storage_bytes = capacity.storage_bytes;
-    destroyContext(capacity);
+
+    if (selection.capacity) {
+        SuiteContext capacity;
+        if (!initializeContext(
+                options,
+                loaded.manifest,
+                options.capacity_probe_tokens,
+                capacity,
+                error)) {
+            destroyContext(capacity);
+            return fail(error);
+        }
+        cases.push_back(runCase(
+            capacity,
+            capacityCase(options.capacity_probe_tokens),
+            0,
+            options.iterations,
+            id_namespace,
+            options.profile
+        ));
+        capacity_storage_bytes = capacity.storage_bytes;
+        if (selection.performance.empty()) {
+            weight_bytes = capacity.weight_bytes;
+            workspace_bytes = capacity.workspace_bytes;
+            loaded_gpu_bytes = capacity.loaded_gpu_bytes;
+        }
+        destroyContext(capacity);
+    }
 
     bool const passed = std::all_of(
         cases.begin(), cases.end(),
@@ -963,6 +1191,10 @@ int main(int argc, char** argv)
         << properties.name << "\",\"cuda_runtime\":" << runtime_version
         << "},\n  \"config\":{\"warmup\":" << options.warmup
         << ",\"iterations\":" << options.iterations
+        << ",\"profile\":" << (options.profile ? "true" : "false")
+        << ",\"selected_case\":\""
+        << (options.case_name.has_value() ? *options.case_name : "all")
+        << "\""
         << ",\"kv_capacity_tokens\":" << options.kv_capacity_tokens
         << ",\"capacity_probe_tokens\":"
         << options.capacity_probe_tokens
