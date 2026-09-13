@@ -812,6 +812,167 @@ __global__ void pagedAttentionOutputBatchKernel(
     }
 }
 
+#if defined(KIM_KV_ENABLE_FUSED_ATTENTION)
+// Four warps own disjoint sequence ranges. Each warp keeps a stable online
+// softmax and its weighted V vector in registers; one block barrier merges
+// the four partials. No score tensor is written to global memory.
+inline constexpr unsigned int kFusedWarps = 4;
+inline constexpr unsigned int kFusedThreads = kFusedWarps * 32;
+inline constexpr unsigned int kFusedMaxDimensions = 128;
+
+__device__ void fusedPagedAttention(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t visible_tokens,
+    std::uint32_t layer,
+    std::uint32_t query_head_count,
+    KvScalar const* query,
+    KvScalar* output,
+    float attention_scale,
+    DeviceLayout layout)
+{
+    extern __shared__ float partials[];
+    unsigned int const lane = threadIdx.x % 32;
+    unsigned int const warp = threadIdx.x / 32;
+    unsigned int const query_head = blockIdx.x;
+    unsigned int const kv_head = query_head / (query_head_count / layout.heads);
+    float q[kFusedMaxDimensions / 32];
+    float weighted[kFusedMaxDimensions / 32] = {};
+    for (unsigned int i = 0; i < kFusedMaxDimensions / 32; ++i) {
+        unsigned int const dimension = lane + i * 32;
+        q[i] = dimension < layout.dimensions
+            ? __half2float(reinterpret_cast<__half const*>(query)[
+                static_cast<std::size_t>(query_head) * layout.dimensions
+                    + dimension]) : 0.0F;
+    }
+    float maximum = -FLT_MAX;
+    float denominator = 0.0F;
+    unsigned int const range = (visible_tokens + kFusedWarps - 1) / kFusedWarps;
+    unsigned int const begin = warp * range;
+    unsigned int const end = min(begin + range, visible_tokens);
+    for (unsigned int token = begin; token < end; ++token) {
+        auto const descriptor = findDescriptor(descriptors, descriptor_count, token);
+        KvScalar const* const page = descriptorPage(
+            descriptor, micro_pool, micro_page_elements,
+            extent_pool, extent_page_elements);
+        unsigned int const page_token = token - descriptor.logical_token_begin;
+        float dot = 0.0F;
+        for (unsigned int i = 0; i < kFusedMaxDimensions / 32; ++i) {
+            unsigned int const dimension = lane + i * 32;
+            if (dimension < layout.dimensions) {
+                float const key = __half2float(reinterpret_cast<__half const*>(page)[
+                    tensorOffset(layout, layer, 0, page_token, kv_head,
+                        dimension, descriptor.page_token_capacity)]);
+                dot += q[i] * key;
+            }
+        }
+        for (unsigned int offset = 16; offset != 0; offset /= 2) {
+            dot += __shfl_down_sync(0xffffffffU, dot, offset);
+        }
+        float const score = __shfl_sync(0xffffffffU, dot, 0) * attention_scale;
+        float const next_maximum = fmaxf(maximum, score);
+        float const rescale = expf(maximum - next_maximum);
+        float const weight = expf(score - next_maximum);
+        denominator = denominator * rescale + weight;
+        for (unsigned int i = 0; i < kFusedMaxDimensions / 32; ++i) {
+            unsigned int const dimension = lane + i * 32;
+            if (dimension < layout.dimensions) {
+                float const value = __half2float(reinterpret_cast<__half const*>(page)[
+                    tensorOffset(layout, layer, 1, page_token, kv_head,
+                        dimension, descriptor.page_token_capacity)]);
+                weighted[i] = weighted[i] * rescale + weight * value;
+            }
+        }
+        maximum = next_maximum;
+    }
+    if (lane == 0) {
+        partials[warp] = maximum;
+        partials[kFusedWarps + warp] = denominator;
+    }
+    for (unsigned int i = 0; i < kFusedMaxDimensions / 32; ++i) {
+        unsigned int const dimension = lane + i * 32;
+        if (dimension < layout.dimensions) {
+            partials[2 * kFusedWarps + warp * layout.dimensions + dimension]
+                = weighted[i];
+        }
+    }
+    __syncthreads();
+    float merged_maximum = -FLT_MAX;
+    for (unsigned int i = 0; i < kFusedWarps; ++i) {
+        merged_maximum = fmaxf(merged_maximum, partials[i]);
+    }
+    float scales[kFusedWarps];
+    float merged_denominator = 0.0F;
+    for (unsigned int i = 0; i < kFusedWarps; ++i) {
+        scales[i] = expf(partials[i] - merged_maximum);
+        merged_denominator += scales[i] * partials[kFusedWarps + i];
+    }
+    for (unsigned int dimension = threadIdx.x;
+         dimension < layout.dimensions; dimension += blockDim.x) {
+        float value = 0.0F;
+        for (unsigned int i = 0; i < kFusedWarps; ++i) {
+            value += scales[i]
+                * partials[2 * kFusedWarps + i * layout.dimensions + dimension];
+        }
+        reinterpret_cast<__half*>(output)[
+            static_cast<std::size_t>(query_head) * layout.dimensions + dimension]
+            = __float2half(value / merged_denominator);
+    }
+}
+
+__global__ void pagedAttentionFusedKernel(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t total_token_count,
+    std::uint32_t query_token_count,
+    std::uint32_t layer,
+    std::uint32_t query_head_count,
+    KvScalar const* query,
+    KvScalar* output,
+    float attention_scale,
+    DeviceLayout layout)
+{
+    unsigned int const query_token = blockIdx.y;
+    std::size_t const offset = static_cast<std::size_t>(query_token)
+        * query_head_count * layout.dimensions;
+    fusedPagedAttention(descriptors, descriptor_count,
+        micro_pool, micro_page_elements, extent_pool, extent_page_elements,
+        total_token_count - query_token_count + query_token + 1,
+        layer, query_head_count, query + offset, output + offset,
+        attention_scale, layout);
+}
+
+__global__ void pagedAttentionFusedBatchKernel(
+    ::kimkvcache::DevicePagedDecodeBatchItem const* items,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements,
+    std::uint32_t query_head_count,
+    DeviceLayout layout)
+{
+    auto const item = items[blockIdx.y];
+    if (item.device_descriptors == nullptr || item.descriptor_count == 0
+        || item.token_count == 0 || item.device_query == nullptr
+        || item.device_output == nullptr || item.device_scores == nullptr) {
+        return;
+    }
+    fusedPagedAttention(item.device_descriptors, item.descriptor_count,
+        micro_pool, micro_page_elements, extent_pool, extent_page_elements,
+        item.token_count, item.layer, query_head_count,
+        item.device_query, item.device_output, item.attention_scale, layout);
+}
+
+#endif
+
 [[nodiscard]] dim3 gridFor(std::size_t element_count) noexcept
 {
     std::size_t const blocks =
@@ -938,6 +1099,17 @@ void launchPagedDecodeAttention(
     DeviceLayout layout,
     cudaStream_t stream)
 {
+#if defined(KIM_KV_ENABLE_FUSED_ATTENTION)
+    if (layout.dimensions <= kFusedMaxDimensions) {
+        std::size_t const shared = kFusedWarps * (layout.dimensions + 2)
+            * sizeof(float);
+        pagedAttentionFusedKernel<<<query_head_count, kFusedThreads, shared, stream>>>(
+            descriptors, descriptor_count, micro_pool, micro_page_elements,
+            extent_pool, extent_page_elements, token_count, 1, layer,
+            query_head_count, query, output, attention_scale, layout);
+        return;
+    }
+#endif
     std::size_t const shared_bytes = kThreadsPerBlock * sizeof(float);
     pagedAttentionScoresKernel<<<
         query_head_count, kThreadsPerBlock, shared_bytes, stream>>>(
@@ -990,6 +1162,18 @@ void launchPagedPrefillAttention(
     DeviceLayout layout,
     cudaStream_t stream)
 {
+#if defined(KIM_KV_ENABLE_FUSED_ATTENTION)
+    if (layout.dimensions <= kFusedMaxDimensions) {
+        std::size_t const shared = kFusedWarps * (layout.dimensions + 2)
+            * sizeof(float);
+        dim3 const fused_grid(query_head_count, query_token_count);
+        pagedAttentionFusedKernel<<<fused_grid, kFusedThreads, shared, stream>>>(
+            descriptors, descriptor_count, micro_pool, micro_page_elements,
+            extent_pool, extent_page_elements, total_token_count, query_token_count,
+            layer, query_head_count, query, output, attention_scale, layout);
+        return;
+    }
+#endif
     std::size_t const shared_bytes = kThreadsPerBlock * sizeof(float);
     dim3 const grid(query_head_count, query_token_count);
     pagedPrefillScoresKernel<<<
@@ -1038,6 +1222,17 @@ void launchPagedDecodeAttentionBatch(
     DeviceLayout layout,
     cudaStream_t stream)
 {
+#if defined(KIM_KV_ENABLE_FUSED_ATTENTION)
+    if (layout.dimensions <= kFusedMaxDimensions) {
+        std::size_t const shared = kFusedWarps * (layout.dimensions + 2)
+            * sizeof(float);
+        dim3 const fused_grid(query_head_count, item_count);
+        pagedAttentionFusedBatchKernel<<<fused_grid, kFusedThreads, shared, stream>>>(
+            items, micro_pool, micro_page_elements, extent_pool,
+            extent_page_elements, query_head_count, layout);
+        return;
+    }
+#endif
     std::size_t const shared_bytes = kThreadsPerBlock * sizeof(float);
     dim3 const grid(query_head_count, item_count);
     pagedAttentionScoresBatchKernel<<<

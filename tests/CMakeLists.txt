@@ -121,6 +121,19 @@ add_kim_kv_contract(
 
 if(KIM_KV_ENABLE_CUDA)
     add_kim_kv_contract(
+        paged_attention_fusion_test
+        paged_attention_fusion_contract
+        cuda/paged_attention_fusion_test.cpp
+        120
+        kim_kv_cuda
+        CUDA::cudart
+    )
+    target_include_directories(
+        paged_attention_fusion_test
+        PRIVATE "${PROJECT_SOURCE_DIR}/src/cuda/kv"
+    )
+
+    add_kim_kv_contract(
         cuda_kv_test
         cuda_kv_contract
         cuda/cuda_kv_test.cpp

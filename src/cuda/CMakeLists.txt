@@ -35,6 +35,10 @@ target_include_directories(
         "${PROJECT_SOURCE_DIR}/include"
 )
 
+if(KIM_KV_ENABLE_FUSED_ATTENTION)
+    target_compile_definitions(kim_kv_cuda PRIVATE KIM_KV_ENABLE_FUSED_ATTENTION=1)
+endif()
+
 target_link_libraries(
     kim_kv_cuda
     PRIVATE

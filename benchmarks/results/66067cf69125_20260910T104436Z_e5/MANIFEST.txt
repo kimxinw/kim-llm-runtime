@@ -1,0 +1,16 @@
+schema_version=1
+stage=E5
+source_commit=66067cf6912588d63ccdf0decdeafc9ea3596e9e
+working_tree_clean=true
+timestamp_utc=20260910T104436Z
+gpu_device=0
+warmup=1
+iterations=3
+kv_capacity_tokens=8192
+capacity_probe_tokens=512
+variants=fixed_8 fixed_16 fixed_32 fixed_64 hetero
+model_manifest=/home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.manifest
+model_weights=/home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.weights
+e8076bba8e05b6dcbd8e7a8a474a522e69d16958a93e6da30133a947622f9ba1  /home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.manifest
+5a25040a72885d3dbf246f6819b09da797eedf2ebee830b3ac98791d4efbeb99  /home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.weights
+e94095fd5ab98b7eaee1dc18aa1b016ed94c4a6d4dc45028234e073cbacc38f2  build-k5-cuda-release/tools/kim_kv_tinyllama_e2e_benchmark

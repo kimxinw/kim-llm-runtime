@@ -28,6 +28,12 @@ option(
     ON
 )
 
+option(
+    KIM_KV_ENABLE_FUSED_ATTENTION
+    "Fuse paged attention score, softmax and output for head dimensions <=128"
+    OFF
+)
+
 if(
     KIM_KV_ENABLE_TSAN
     AND

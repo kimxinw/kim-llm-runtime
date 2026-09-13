@@ -566,11 +566,15 @@ private:
         error = "create Engine KV backend failed";
         return false;
     }
+
+    CudaModelRunnerOptions runner_options;
+    runner_options.max_batch_size = 32;
     context.model = createCudaTinyLlamaModelRunner(
         options.manifest,
         options.weights,
         *context.backend,
-        reinterpret_cast<EngineStream>(context.stream)
+        reinterpret_cast<EngineStream>(context.stream),
+        runner_options
     );
     if (!context.model.ok()) {
         error = context.model.status.detail;
