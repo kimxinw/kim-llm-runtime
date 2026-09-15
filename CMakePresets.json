@@ -36,6 +36,26 @@
         "KIM_KV_ENABLE_CUDA": "ON",
         "CMAKE_CUDA_ARCHITECTURES": "86"
       }
+    },
+    {
+      "name": "cuda-release-reference",
+      "displayName": "CUDA Release Reference (SM 86)",
+      "description": "Two-stage paged attention reference build",
+      "inherits": "cuda-release",
+      "binaryDir": "${sourceDir}/build-k5-cuda-reference",
+      "cacheVariables": {
+        "KIM_KV_ENABLE_FUSED_ATTENTION": "OFF"
+      }
+    },
+    {
+      "name": "cuda-release-fused",
+      "displayName": "CUDA Release Fused (SM 86)",
+      "description": "Fused paged attention release build",
+      "inherits": "cuda-release",
+      "binaryDir": "${sourceDir}/build-k5-cuda-fused",
+      "cacheVariables": {
+        "KIM_KV_ENABLE_FUSED_ATTENTION": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -46,6 +66,14 @@
     {
       "name": "cuda-release",
       "configurePreset": "cuda-release"
+    },
+    {
+      "name": "cuda-release-reference",
+      "configurePreset": "cuda-release-reference"
+    },
+    {
+      "name": "cuda-release-fused",
+      "configurePreset": "cuda-release-fused"
     }
   ],
   "testPresets": [
@@ -59,6 +87,20 @@
     {
       "name": "cuda-release",
       "configurePreset": "cuda-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "cuda-release-reference",
+      "configurePreset": "cuda-release-reference",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "cuda-release-fused",
+      "configurePreset": "cuda-release-fused",
       "output": {
         "outputOnFailure": true
       }
