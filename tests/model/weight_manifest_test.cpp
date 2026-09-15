@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,6 +23,53 @@ void expect(bool condition, std::string const& message)
         ++failures;
     }
 }
+
+class UniqueTempDirectory {
+public:
+    explicit UniqueTempDirectory(std::string const& prefix)
+    {
+        std::filesystem::path const parent =
+            std::filesystem::temp_directory_path();
+        std::mt19937_64 random(std::random_device{}());
+        std::uniform_int_distribution<std::uint64_t> suffix;
+
+        constexpr unsigned int kMaximumAttempts = 128;
+        for (unsigned int attempt = 0; attempt < kMaximumAttempts; ++attempt) {
+            std::filesystem::path candidate = parent
+                / (prefix + "_" + std::to_string(suffix(random)));
+            std::error_code error;
+            if (std::filesystem::create_directory(candidate, error)) {
+                path_ = std::move(candidate);
+                return;
+            }
+            if (error) {
+                throw std::filesystem::filesystem_error(
+                    "create unique temporary directory", candidate, error
+                );
+            }
+        }
+
+        throw std::runtime_error("exhausted temporary directory candidates");
+    }
+
+    ~UniqueTempDirectory()
+    {
+        std::error_code error;
+        static_cast<void>(std::filesystem::remove_all(path_, error));
+        expect(!error, "remove unique temporary directory");
+    }
+
+    UniqueTempDirectory(UniqueTempDirectory const&) = delete;
+    UniqueTempDirectory& operator=(UniqueTempDirectory const&) = delete;
+
+    [[nodiscard]] std::filesystem::path const& path() const noexcept
+    {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
 
 std::vector<std::pair<std::string, std::vector<std::uint32_t>>>
 expectedTensors(TinyLlamaConfig const& config)
@@ -118,9 +167,8 @@ void testManifestContract()
     expect(config.valid(), "small model config is valid");
     expect(tinyLlama11bChatConfig().valid(), "production config is valid");
 
-    std::filesystem::path const root =
-        std::filesystem::temp_directory_path() / "kim_kv_manifest_contract";
-    std::filesystem::create_directories(root);
+    UniqueTempDirectory const temporary_directory("kim_kv_manifest_contract");
+    std::filesystem::path const& root = temporary_directory.path();
     std::filesystem::path const data_path = root / "weights.bin";
     std::filesystem::path const manifest_path = root / "weights.manifest";
 
@@ -189,7 +237,6 @@ void testManifestContract()
     expect(validateWeightManifest(duplicate).error
         == WeightManifestError::DuplicateTensor,
         "duplicate tensor is rejected");
-    std::filesystem::remove_all(root);
 }
 
 } // namespace
