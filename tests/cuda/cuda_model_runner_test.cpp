@@ -2,6 +2,7 @@
 #include "kim-kv/cuda/cuda_model_runner.h"
 #include "kim-kv/engine/iteration_scheduler.h"
 #include "kim-kv/model/weight_manifest.h"
+#include "support/unique_temp_directory.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
@@ -56,25 +57,26 @@ struct TestArchive final {
     TinyLlamaConfig config{
         8, 16, 2, 4, 2, 2, 16, 256, 1, 2, 1.0e-5F, 10000.0F, false,
     };
+    test_support::UniqueTempDirectory temporary_directory;
     std::filesystem::path root{};
     std::filesystem::path manifest_path{};
     std::filesystem::path data_path{};
     std::unordered_map<std::string, std::vector<float>> weights{};
     WeightManifest manifest{};
 
-    explicit TestArchive(std::filesystem::path value)
-        : root(std::move(value))
+    explicit TestArchive(std::string const& prefix)
+        : temporary_directory(prefix)
+        , root(temporary_directory.path())
         , manifest_path(root / "model.manifest")
         , data_path(root / "model.weights")
     {
-        std::filesystem::remove_all(root);
-        std::filesystem::create_directories(root);
         build();
     }
 
     ~TestArchive()
     {
-        std::filesystem::remove_all(root);
+        expect(!temporary_directory.cleanup(),
+            "remove unique model test directory");
     }
 
     void addTensor(
@@ -472,9 +474,7 @@ std::uint32_t eosOutside(
 
 void testModelRunner()
 {
-    TestArchive archive(
-        std::filesystem::temp_directory_path() / "kim_kv_model_runner_contract"
-    );
+    TestArchive archive("kim_kv_model_runner_contract");
     cudaStream_t stream = nullptr;
     expect(cudaStreamCreate(&stream) == cudaSuccess, "create model stream");
     std::size_t const attention_workspace =
@@ -605,10 +605,7 @@ void testModelRunner()
 
 void testGenerationRuntime()
 {
-    TestArchive archive(
-        std::filesystem::temp_directory_path()
-            / "kim_kv_generation_runtime_cuda_contract"
-    );
+    TestArchive archive("kim_kv_generation_runtime_cuda_contract");
     cudaStream_t stream = nullptr;
     expect(cudaStreamCreate(&stream) == cudaSuccess,
         "create generation stream");
@@ -707,10 +704,7 @@ void testGenerationRuntime()
 
 void testIterationSchedulerRuntime()
 {
-    TestArchive archive(
-        std::filesystem::temp_directory_path()
-            / "kim_kv_iteration_scheduler_cuda_contract"
-    );
+    TestArchive archive("kim_kv_iteration_scheduler_cuda_contract");
     cudaStream_t stream = nullptr;
     expect(cudaStreamCreate(&stream) == cudaSuccess,
         "create scheduler stream");

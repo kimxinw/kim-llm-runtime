@@ -1,4 +1,5 @@
 #include "kim-kv/benchmark/benchmark.h"
+#include "support/unique_temp_directory.h"
 
 #include <algorithm>
 #include <cmath>
@@ -273,9 +274,10 @@ void testCpuHarnessAndReports()
         expect(!result.samples.empty(), "workload must retain raw samples");
     }
 
-    std::filesystem::path const directory =
-        std::filesystem::temp_directory_path()
-        / "kim_kv_benchmark_contract";
+    kimkvcache::test_support::UniqueTempDirectory temporary_directory(
+        "kim_kv_benchmark_contract"
+    );
+    std::filesystem::path const& directory = temporary_directory.path();
     std::filesystem::path const json = directory / "result.json";
     std::filesystem::path const csv = directory / "result.csv";
     writeJsonReport(report, json.string());
@@ -311,7 +313,10 @@ void testCpuHarnessAndReports()
         csv_text.find("sample,cpu_metadata") != std::string::npos,
         "CSV must include raw operation samples"
     );
-    std::filesystem::remove_all(directory);
+    json_input.close();
+    csv_input.close();
+    expect(!temporary_directory.cleanup(),
+        "remove unique benchmark directory");
 }
 
 void testFixedPageHarnessAndCommandLine()

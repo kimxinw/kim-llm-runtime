@@ -11,6 +11,12 @@ function(add_kim_kv_contract target_name test_name source_file timeout_seconds)
             ${ARGN}
     )
 
+    target_include_directories(
+        ${target_name}
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+
     add_test(
         NAME ${test_name}
         COMMAND ${target_name}
