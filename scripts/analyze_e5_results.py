@@ -142,7 +142,7 @@ def write_summary_csv(root: Path, reports: dict[str, dict[str, Any]]) -> None:
         "rejected",
     ]
     with (root / "summary.csv").open("w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=columns)
+        writer = csv.DictWriter(output, fieldnames=columns, lineterminator="\n")
         writer.writeheader()
         for variant in VARIANTS:
             for case in reports[variant]["cases"]:

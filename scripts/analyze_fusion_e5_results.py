@@ -198,7 +198,9 @@ def write_csv(root: Path, comparisons: list[dict[str, Any]]) -> None:
     with (root / "fusion_comparison.csv").open(
         "w", newline="", encoding="utf-8"
     ) as output:
-        writer = csv.DictWriter(output, fieldnames=list(comparisons[0]))
+        writer = csv.DictWriter(
+            output, fieldnames=list(comparisons[0]), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(comparisons)
 
