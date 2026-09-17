@@ -47,9 +47,9 @@ flowchart LR
 
 | 项目 | 结果 |
 |---|---:|
-| CPU / CUDA Release | `13/13 PASS` / `20/20 PASS` |
+| CPU / CUDA Release | `13/13 PASS` / Reference、Fused 各 `21/21 PASS` |
 | CPU ASan/UBSan | `13/13 PASS` |
-| CUDA Sanitizer | memcheck、racecheck、initcheck 均为 `0 errors` |
+| CUDA Sanitizer | Reference/Fused × 4 个 CUDA 合同 × 3 个工具，`24/24 PASS`；memcheck/initcheck `0 errors`，racecheck `0 errors/0 warnings` |
 | 模型正确性 | Hidden、Logits、Top-10 通过数值门禁 |
 | 端到端生成 | 8 个 Prompt 的完整 Token 与 Transformers FP16 一致 |
 | 正式性能矩阵 | 五策略 × 9 Case × 3 轮，`135/135` 个 Run 的预期结果与资源回收全部通过 |
@@ -71,6 +71,9 @@ ctest --preset cpu-release
 CUDACXX=/path/to/nvcc cmake --preset cuda-release
 cmake --build --preset cuda-release --parallel
 ctest --preset cuda-release
+
+# Reference/Fused Compute Sanitizer 矩阵
+scripts/run_compute_sanitizer_matrix.sh
 ```
 
 ## 运行
@@ -98,5 +101,5 @@ scripts/run_e5_end_to_end.sh
 - 单 GPU、单模型、同步 Scheduler
 - Ragged Batched Decode Attention 与 Multi-token Causal Prefill Attention 已实现
 - 单 Token 多请求继续使用 Batch KV/Attention Kernel；包含多 Token Chunk 的混合 Batch 当前按请求提交 KV/Attention Kernel
-- Prefill Attention Scores 与 Softmax/Value Output 仍为两个 Kernel；Workspace 上界随 `chunk_tokens × query_heads × sequence_tokens` 增长
+- Reference 路径的 Prefill Attention Scores 与 Softmax/Value Output 仍为两个 Kernel；Fused 路径在 head dimension ≤128 时使用在线 Softmax 单 Kernel，>128 回退 Reference；两条路径仍保留 Score Workspace 接口
 - 自动 Promotion 当前在 Token Commit 边界同步执行；失败后不做后台重试
