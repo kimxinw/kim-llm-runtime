@@ -94,6 +94,9 @@ build-k5-cuda-release/tools/kim_kv_tinyllama_generate \
 ```bash
 scripts/run_k6_release_matrix.sh
 scripts/run_e5_end_to_end.sh
+
+# Reference/Fused × 五种分页策略的正式 E2E A/B 矩阵
+scripts/run_fusion_e5_matrix.sh
 ```
 
 ## 当前边界

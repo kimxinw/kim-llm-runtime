@@ -360,7 +360,7 @@ def write_report(
             "",
             f"- Hetero 的 Extent Page 分配次数为 `{hetero_secondary_allocations}`。大于零表示 Generation 自动 Promotion 已在本轮 E2E Workload 中生效，长序列实际使用了 Extent Page。",
             "- Dense GEMM 已按总 Token 数动态 Batch 执行；单 Token 多请求使用 Batch KV Write 与 Paged Decode Attention。多 Token Chunk 已走真实因果 Prefill，但包含多 Token Chunk 的混合 Batch 仍按请求提交 KV/Attention。",
-            "- Prefill Attention 的 Scores 与 Softmax/Value Output 仍为两个 Kernel，Score Workspace 随 `chunk_tokens × query_heads × sequence_tokens` 增长。",
+            "- Reference 的 Prefill Attention Scores 与 Softmax/Value Output 为两个 Kernel；Fused 在 head dimension ≤128 时使用在线 Softmax 单 Kernel，>128 回退 Reference。两条路径仍保留 Score Workspace 接口。",
             "- Microbenchmark 与本报告的 E2E 结果分开；K6 的 Gather/Promotion 收益不能直接替代模型端到端收益。",
             "- Nsight Systems GPU Activity Timeline 受当前 WSL2/CUPTI 环境限制，本报告不以 CUDA API Duration 冒充 Kernel Timeline。",
             "- 未与 vLLM 或 TensorRT-LLM 比较峰值性能。",
