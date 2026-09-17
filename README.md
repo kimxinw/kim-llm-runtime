@@ -53,11 +53,14 @@ flowchart LR
 | 模型正确性 | Hidden、Logits、Top-10 通过数值门禁 |
 | 端到端生成 | 8 个 Prompt 的完整 Token 与 Transformers FP16 一致 |
 | 正式性能矩阵 | 五策略 × 9 Case × 3 轮，`135/135` 个 Run 的预期结果与资源回收全部通过 |
+| Fusion 正式 A/B | Reference/Fused × 五策略 × 9 Case × 3 轮，共 `270/270` 个 Run；配置、Token、故障/容量结果一致 |
 | KV 收益 | Hetero 相对 Fixed-8 的 Long c1/c2/c4 E2E p50 降低 `17.13%/14.56%/11.85%`，Output tokens/s 提高 `20.73%/15.89%/13.42%` |
+| Fusion 收益 | Hetero 的 Short c1/c2/c4 E2E p50 降低 `12.54%/13.86%/18.96%`，Long c1/c2/c4 降低 `34.34%/41.21%/53.13%`，Mixed c4 降低 `44.68%` |
 | 容量边界 | Hetero 峰值碎片为 `0`，Capacity 完成数 `30`，高于 Fixed-64 的 `24`、低于 Fixed-8/16/32 的 `48` |
 
-完整结果位于 `tests/reference` 和 `benchmarks/results`；当前正式 E5 证据为
-`benchmarks/results/66067cf69125_20260910T104436Z_e5`。
+完整结果位于 `tests/reference` 和 `benchmarks/results`；分页策略正式 E5 证据为
+`benchmarks/results/66067cf69125_20260910T104436Z_e5`，Reference/Fused 正式 A/B 证据为
+`benchmarks/results/0dc98d1149b1_20260917T075135Z_fusion_e5`。
 
 ## 构建与测试
 

@@ -1,0 +1,60 @@
+{
+  "batched_attention_active": true,
+  "engine_promotion_active": true,
+  "fairness": {
+    "config_equal": true,
+    "cross_variant_tokens_equal": true,
+    "storage_budget_equal": true,
+    "token_cases": {
+      "decode_long_prompt_c1": true,
+      "decode_long_prompt_c2": true,
+      "decode_long_prompt_c4": true,
+      "decode_short_c1": true,
+      "decode_short_c2": true,
+      "decode_short_c4": true,
+      "mixed_c4": true
+    },
+    "transformers_reference_passed": true,
+    "transformers_reference_prompts": 8
+  },
+  "hetero_secondary_allocations": 18,
+  "hetero_vs_fixed_8": {
+    "decode_long_prompt_c1": {
+      "e2e_p50_delta_percent": -2.960103037365424,
+      "output_tokens_per_second_delta_percent": 3.0950612064509384,
+      "tpot_p50_delta_percent": -3.575019468466939
+    },
+    "decode_long_prompt_c2": {
+      "e2e_p50_delta_percent": -2.1600428663536246,
+      "output_tokens_per_second_delta_percent": 2.1036676732565427,
+      "tpot_p50_delta_percent": -1.9531095539302223
+    },
+    "decode_long_prompt_c4": {
+      "e2e_p50_delta_percent": -0.5722191344131419,
+      "output_tokens_per_second_delta_percent": 0.5601179987119723,
+      "tpot_p50_delta_percent": -0.9103050069010059
+    },
+    "decode_short_c1": {
+      "e2e_p50_delta_percent": -6.311606499380817,
+      "output_tokens_per_second_delta_percent": 6.739550781194191,
+      "tpot_p50_delta_percent": -6.512667651336418
+    },
+    "decode_short_c2": {
+      "e2e_p50_delta_percent": 2.7973501265074043,
+      "output_tokens_per_second_delta_percent": -2.51759802712819,
+      "tpot_p50_delta_percent": 2.9646523548298847
+    },
+    "decode_short_c4": {
+      "e2e_p50_delta_percent": 4.698232071318976,
+      "output_tokens_per_second_delta_percent": -4.231904188407488,
+      "tpot_p50_delta_percent": 4.705447406623797
+    },
+    "mixed_c4": {
+      "e2e_p50_delta_percent": 0.31945490012096256,
+      "output_tokens_per_second_delta_percent": -0.22025327493958308,
+      "tpot_p50_delta_percent": -1.2606069001376694
+    }
+  },
+  "schema_version": 1,
+  "successful": true
+}
