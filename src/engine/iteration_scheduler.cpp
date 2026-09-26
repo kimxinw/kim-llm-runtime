@@ -52,9 +52,11 @@ public:
     Impl(
         EngineKvBackend& kv_backend,
         GenerationModelRunner& model_runner,
-        IterationSchedulerConfig scheduler_config) noexcept
+        IterationSchedulerConfig scheduler_config,
+        GenerationTokenSink* sink) noexcept
         : kv(&kv_backend)
         , runner(&model_runner)
+        , token_sink(sink)
         , config(scheduler_config)
     {
     }
@@ -337,6 +339,19 @@ public:
             );
             return;
         }
+        if (token_sink != nullptr && !token_sink->onToken(
+                record.request.request_id,
+                step.greedy_token_id,
+                record.terminal.output_token_ids.size() - 1)) {
+            record.terminal.output_token_ids.pop_back();
+            finish(
+                record,
+                GenerationTerminalReason::Failed,
+                GenerationError::OutputBackpressure,
+                "token sink rejected generated token"
+            );
+            return;
+        }
         record.last_token_time = Clock::now();
         if (!record.emitted_token) {
             record.first_token_time = record.last_token_time;
@@ -366,6 +381,7 @@ public:
 
     EngineKvBackend* kv{nullptr};
     GenerationModelRunner* runner{nullptr};
+    GenerationTokenSink* token_sink{nullptr};
     IterationSchedulerConfig config{};
     std::atomic<bool> stopped{false};
     std::unordered_map<RequestId, Record> records{};
@@ -373,6 +389,7 @@ public:
     std::deque<RequestId> schedule_queue{};
     std::vector<GenerationTerminal> terminal_queue{};
     std::uint64_t iteration_count{0};
+    std::uint64_t accepted_count{0};
     std::uint64_t reserved_kv_tokens{0};
     std::uint64_t model_forward_tokens{0};
     std::uint64_t model_forward_batches{0};
@@ -383,8 +400,9 @@ public:
 IterationSchedulerRuntime::IterationSchedulerRuntime(
     EngineKvBackend& kv_backend,
     GenerationModelRunner& model_runner,
-    IterationSchedulerConfig config)
-    : impl_(std::make_unique<Impl>(kv_backend, model_runner, config))
+    IterationSchedulerConfig config,
+    GenerationTokenSink* token_sink)
+    : impl_(std::make_unique<Impl>(kv_backend, model_runner, config, token_sink))
 {
 }
 
@@ -466,6 +484,7 @@ SchedulerAdmissionResult IterationSchedulerRuntime::submit(
             throw;
         }
         impl_->reserved_kv_tokens += kv_budget;
+        ++impl_->accepted_count;
     } catch (std::bad_alloc const&) {
         return {
             false,
@@ -714,6 +733,25 @@ std::vector<GenerationTerminal> IterationSchedulerRuntime::takeTerminals()
     return result;
 }
 
+bool IterationSchedulerRuntime::forgetRequest(RequestId request_id)
+{
+    auto const state = impl_->states.find(request_id);
+    if (state == impl_->states.end()
+        || (state->second != SchedulerRequestState::Terminal
+            && state->second != SchedulerRequestState::Rejected)) {
+        return false;
+    }
+    if (std::any_of(impl_->terminal_queue.begin(), impl_->terminal_queue.end(),
+            [request_id](GenerationTerminal const& terminal) {
+                return terminal.request_id == request_id;
+            })) {
+        return false;
+    }
+    impl_->records.erase(request_id);
+    impl_->states.erase(state);
+    return true;
+}
+
 std::optional<SchedulerRequestState> IterationSchedulerRuntime::requestState(
     RequestId request_id) const
 {
@@ -728,7 +766,7 @@ IterationSchedulerSnapshot IterationSchedulerRuntime::snapshot() const
 {
     IterationSchedulerSnapshot result;
     result.iteration_count = impl_->iteration_count;
-    result.accepted_count = impl_->records.size();
+    result.accepted_count = impl_->accepted_count;
     result.reserved_kv_tokens = impl_->reserved_kv_tokens;
     result.model_forward_tokens = impl_->model_forward_tokens;
     result.model_forward_batches = impl_->model_forward_batches;

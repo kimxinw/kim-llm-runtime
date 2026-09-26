@@ -141,6 +141,32 @@ public:
     }
 };
 
+class RecordingTokenSink final : public GenerationTokenSink {
+public:
+    struct Event {
+        RequestId request_id;
+        std::uint32_t token_id;
+        std::uint64_t sequence_no;
+    };
+
+    RequestId reject_request{kInvalidRequestId};
+    std::vector<Event> events{};
+
+    bool onToken(RequestId request_id, std::uint32_t token_id,
+        std::uint64_t sequence_no) noexcept override
+    {
+        if (request_id == reject_request) {
+            return false;
+        }
+        try {
+            events.push_back({request_id, token_id, sequence_no});
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+
 std::vector<std::uint32_t> prompt(std::uint32_t length)
 {
     std::vector<std::uint32_t> tokens(length);
@@ -443,6 +469,51 @@ void testDestructorReclaimsActiveRequests()
         "scheduler destructor preserves backend invariants");
 }
 
+void testTokenSinkAndRequestRetirement()
+{
+    FakeKvBackend backend;
+    FakeModelRunner runner;
+    RecordingTokenSink sink;
+    sink.reject_request = 3001;
+    IterationSchedulerRuntime scheduler(backend, runner, {2, 4, 4096}, &sink);
+    expect(scheduler.submit(request(3000, 2, 3)).ok(),
+        "token sink healthy request accepted");
+    expect(scheduler.submit(request(3001, 3, 3)).ok(),
+        "token sink backpressure request accepted");
+    expect(!scheduler.forgetRequest(3000),
+        "active request cannot be retired");
+
+    while (!scheduler.idle()) {
+        static_cast<void>(scheduler.runIteration());
+    }
+    expect(!scheduler.forgetRequest(3000),
+        "undelivered terminal cannot be retired");
+    auto terminals = byId(scheduler.takeTerminals());
+    expect(terminals.size() == 2, "both requests produce one terminal");
+    expect(terminals[3000].ok(), "healthy peer completes after sink rejection");
+    expect(terminals[3001].error == GenerationError::OutputBackpressure,
+        "sink rejection is classified as output backpressure");
+    expect(terminals[3001].usage.completion_tokens == 0,
+        "rejected token is excluded from delivered usage");
+    auto const expected = referenceGreedy(prompt(2), 3);
+    expect(sink.events.size() == expected.size(),
+        "healthy request receives each generated token");
+    for (std::size_t index = 0; index < sink.events.size(); ++index) {
+        expect(sink.events[index].request_id == 3000
+            && sink.events[index].token_id == expected[index]
+            && sink.events[index].sequence_no == index,
+            "token sink preserves request id, token and sequence number");
+    }
+    expect(scheduler.forgetRequest(3000) && scheduler.forgetRequest(3001),
+        "delivered terminal records can be retired");
+    expect(!scheduler.requestState(3000).has_value()
+        && !scheduler.requestState(3001).has_value(),
+        "retirement removes scheduler bookkeeping");
+    expect(scheduler.snapshot().accepted_count == 2,
+        "retirement preserves lifetime accepted count");
+    expectReclaimed(backend, scheduler, "token sink retirement");
+}
+
 } // namespace
 
 int main()
@@ -454,6 +525,7 @@ int main()
     testCancellationFailureAndOomIsolation();
     testRuntimeStopAndPressureStability();
     testDestructorReclaimsActiveRequests();
+    testTokenSinkAndRequestRetirement();
     if (failures == 0) {
         std::cout << "Iteration scheduler contract passed\n";
     }

@@ -19,6 +19,7 @@ enum class GenerationError : std::uint8_t {
     RuntimeStopped,
     ModelFailed,
     KvBackendFailed,
+    OutputBackpressure,
     InternalError,
 };
 
@@ -36,6 +37,8 @@ enum class GenerationError : std::uint8_t {
         return "model_failed";
     case GenerationError::KvBackendFailed:
         return "kv_backend_failed";
+    case GenerationError::OutputBackpressure:
+        return "output_backpressure";
     case GenerationError::InternalError:
         return "internal_error";
     }
@@ -118,6 +121,18 @@ struct GenerationTerminal final {
             && (reason == GenerationTerminalReason::EosToken
                 || reason == GenerationTerminalReason::MaxNewTokens);
     }
+};
+
+class GenerationTokenSink {
+public:
+    virtual ~GenerationTokenSink() = default;
+
+    // 返回 false 表示下游无法接收该 token。
+    virtual bool onToken(
+        RequestId request_id,
+        std::uint32_t token_id,
+        std::uint64_t sequence_no
+    ) noexcept = 0;
 };
 
 struct GenerationStepResult final {

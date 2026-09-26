@@ -141,7 +141,8 @@ public:
     IterationSchedulerRuntime(
         EngineKvBackend& kv_backend,
         GenerationModelRunner& model_runner,
-        IterationSchedulerConfig config
+        IterationSchedulerConfig config,
+        GenerationTokenSink* token_sink = nullptr
     );
 
     ~IterationSchedulerRuntime();
@@ -164,6 +165,11 @@ public:
 
     // Terminal delivery is destructive; a terminal is never returned twice.
     [[nodiscard]] std::vector<GenerationTerminal> takeTerminals();
+
+    // Release historical request bookkeeping after its terminal was consumed.
+    // Active requests and terminals still waiting in the delivery queue cannot
+    // be forgotten.
+    [[nodiscard]] bool forgetRequest(RequestId request_id);
 
     [[nodiscard]] std::optional<SchedulerRequestState> requestState(
         RequestId request_id
