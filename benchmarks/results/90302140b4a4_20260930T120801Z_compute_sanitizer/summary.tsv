@@ -1,0 +1,13 @@
+variant	tool	test	status	exit_code	duration_seconds	log
+fused	memcheck	paged_attention_fusion_test	PASS	0	1	logs/fused_memcheck_paged_attention_fusion_test.log
+fused	memcheck	cuda_kv_test	PASS	0	1	logs/fused_memcheck_cuda_kv_test.log
+fused	memcheck	cuda_engine_kv_backend_test	PASS	0	0	logs/fused_memcheck_cuda_engine_kv_backend_test.log
+fused	memcheck	cuda_model_runner_test	PASS	0	6	logs/fused_memcheck_cuda_model_runner_test.log
+fused	racecheck	paged_attention_fusion_test	PASS	0	5	logs/fused_racecheck_paged_attention_fusion_test.log
+fused	racecheck	cuda_kv_test	PASS	0	1	logs/fused_racecheck_cuda_kv_test.log
+fused	racecheck	cuda_engine_kv_backend_test	PASS	0	5	logs/fused_racecheck_cuda_engine_kv_backend_test.log
+fused	racecheck	cuda_model_runner_test	PASS	0	33	logs/fused_racecheck_cuda_model_runner_test.log
+fused	initcheck	paged_attention_fusion_test	PASS	0	1	logs/fused_initcheck_paged_attention_fusion_test.log
+fused	initcheck	cuda_kv_test	PASS	0	1	logs/fused_initcheck_cuda_kv_test.log
+fused	initcheck	cuda_engine_kv_backend_test	PASS	0	0	logs/fused_initcheck_cuda_engine_kv_backend_test.log
+fused	initcheck	cuda_model_runner_test	PASS	0	4	logs/fused_initcheck_cuda_model_runner_test.log

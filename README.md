@@ -48,24 +48,27 @@ flowchart LR
 
 | 项目 | 结果 |
 |---|---:|
-| CPU / CUDA Release | `13/13 PASS` / Reference、Fused、Fused+Cursor 各 `21/21 PASS` |
+| CPU / CUDA Release | `13/13 PASS` / Reference、Fused（默认含 Cursor）、Fused (No Cursor) 各 `21/21 PASS` |
 | CPU ASan/UBSan | `13/13 PASS` |
-| CUDA Sanitizer | Reference/Fused × 4 个 CUDA 合同 × 3 个工具，`24/24 PASS`；Fused+Cursor `12/12 PASS`；memcheck/initcheck `0 errors`，racecheck `0 errors/0 warnings` |
+| CUDA Sanitizer | Reference/Fused（无 Cursor）× 4 个 CUDA 合同 × 3 个工具，`24/24 PASS`；含 Cursor 的 Fused 在 `bfc1cc0` 与默认开启后的 `9030214` 各 `12/12 PASS`；memcheck/initcheck `0 errors`，racecheck `0 errors/0 warnings` |
 | 模型正确性 | Hidden、Logits、Top-10 通过数值门禁 |
-| 端到端生成 | 8 个 Prompt 的完整 Token 与 Transformers FP16 一致 |
+| 端到端生成 | 8 个 Prompt 的完整 Token 与 Transformers FP16 一致；long 套件 10 个唯一 Prompt（32/512/1024-Token）同样完全一致 |
 | 正式性能矩阵 | 五策略 × 9 Case × 3 轮，`135/135` 个 Run 的预期结果与资源回收全部通过 |
 | Fusion 正式 A/B | Reference/Fused × 五策略 × 9 Case × 3 轮，共 `270/270` 个 Run；配置、Token、故障/容量结果一致 |
-| KV 收益 | Hetero 相对 Fixed-8 的 Long c1/c2/c4 E2E p50 降低 `17.13%/14.56%/11.85%`，Output tokens/s 提高 `20.73%/15.89%/13.42%` |
+| KV 收益（`66067cf`，Reference Attention） | Hetero 相对 Fixed-8 的 Long c1/c2/c4 E2E p50 降低 `17.13%/14.56%/11.85%`，Output tokens/s 提高 `20.73%/15.89%/13.42%` |
 | Fusion 收益 | Hetero 的 Short c1/c2/c4 E2E p50 降低 `12.54%/13.86%/18.96%`，Long c1/c2/c4 降低 `34.34%/41.21%/53.13%`，Mixed c4 降低 `44.68%` |
 | 容量边界 | Hetero 峰值碎片为 `0`，Capacity 完成数 `30`，高于 Fixed-64 的 `24`、低于 Fixed-8/16/32 的 `48` |
-| Descriptor Cursor 正式 A/B | Fused/Fused+Cursor × 五策略 × 9 Case × 3 轮，共 `270/270` 个 Run；配置、Token、故障/容量结果一致 |
-| Descriptor Cursor 收益 | Kernel 层（开发期 NCU）：1024-Token 8 请求 Batch 融合 Kernel `705.38 → 251.30 us`；E2E 层：p50 差值中位数 `-0.55%`，处于同代码跨次运行波动（中位 `5.31%`）内，无可分辨变化 |
+| Descriptor Cursor 正式 A/B | standard 套件：无/有 Cursor × 五策略 × 9 Case × 3 轮，`270/270` 个 Run；long 套件：无/有 Cursor × 五策略 × 4 Case × 3 轮，`120/120` 个 Run；配置、Token、故障/容量结果一致 |
+| Descriptor Cursor 收益 | long 套件 `20/20` 个策略/Case 的 E2E p50 降低，中位 `29.87%`（`6.20%～72.03%`）；1024-Token c1/c4 在 Hetero 降低 `23.39%/30.13%`、Fixed-8 降低 `67.30%/72.03%`；standard 套件（上下文 ≤160 Token）E2E 无可分辨变化；Kernel 层（开发期 NCU）1024-Token 8 请求 Batch `705.38 → 251.30 us` |
+| 分页策略与 Cursor | long 套件关闭 Cursor 时五策略 E2E p50 最大差距达 `163%`，开启后 ≤`6.49%`，Hetero 相对 Fixed-8 仅 `-0.97%～-3.15%`：长上下文下页粒度带来的 E2E 差异主要来自逐 Token Descriptor 查找，Cursor 默认开启后异构分页的收益主要体现在碎片与容量 |
 
 完整结果位于 `tests/reference` 和 `benchmarks/results`；分页策略正式 E5 证据为
 `benchmarks/results/66067cf69125_20260910T104436Z_e5`，Reference/Fused 正式 A/B 证据为
-`benchmarks/results/0dc98d1149b1_20260917T075135Z_fusion_e5`；Descriptor Cursor 正式 A/B 与
+`benchmarks/results/0dc98d1149b1_20260917T075135Z_fusion_e5`；Descriptor Cursor standard 套件 A/B 与
 Sanitizer 证据为 `benchmarks/results/bfc1cc063147_20260930T031045Z_fused_fused_cursor_e5` 与
-`benchmarks/results/bfc1cc063147_20260930T030301Z_compute_sanitizer`。
+`benchmarks/results/bfc1cc063147_20260930T030301Z_compute_sanitizer`；Cursor 默认开启后的 long 套件 A/B 与
+Sanitizer 证据为 `benchmarks/results/90302140b4a4_20260930T120931Z_fused_no_cursor_fused_long_e5` 与
+`benchmarks/results/90302140b4a4_20260930T120801Z_compute_sanitizer`。
 
 ## 构建与测试
 
