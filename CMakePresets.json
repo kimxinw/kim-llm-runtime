@@ -44,27 +44,30 @@
       "inherits": "cuda-release",
       "binaryDir": "${sourceDir}/build-k5-cuda-reference",
       "cacheVariables": {
-        "KIM_KV_ENABLE_FUSED_ATTENTION": "OFF"
+        "KIM_KV_ENABLE_FUSED_ATTENTION": "OFF",
+        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR": "OFF"
       }
     },
     {
       "name": "cuda-release-fused",
       "displayName": "CUDA Release Fused (SM 86)",
-      "description": "Fused paged attention release build",
+      "description": "Fused paged attention with page-wise descriptor traversal",
       "inherits": "cuda-release",
       "binaryDir": "${sourceDir}/build-k5-cuda-fused",
       "cacheVariables": {
-        "KIM_KV_ENABLE_FUSED_ATTENTION": "ON"
+        "KIM_KV_ENABLE_FUSED_ATTENTION": "ON",
+        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR": "ON"
       }
     },
     {
-      "name": "cuda-release-fused-cursor",
-      "displayName": "CUDA Release Fused + Descriptor Cursor (SM 86)",
-      "description": "Fused paged attention with page-wise descriptor traversal",
-      "inherits": "cuda-release-fused",
-      "binaryDir": "${sourceDir}/build-k5-cuda-fused-cursor",
+      "name": "cuda-release-fused-no-cursor",
+      "displayName": "CUDA Release Fused without Descriptor Cursor (SM 86)",
+      "description": "Fused paged attention A/B baseline with per-token descriptor lookup",
+      "inherits": "cuda-release",
+      "binaryDir": "${sourceDir}/build-k5-cuda-fused-no-cursor",
       "cacheVariables": {
-        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR": "ON"
+        "KIM_KV_ENABLE_FUSED_ATTENTION": "ON",
+        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR": "OFF"
       }
     }
   ],
@@ -86,8 +89,8 @@
       "configurePreset": "cuda-release-fused"
     },
     {
-      "name": "cuda-release-fused-cursor",
-      "configurePreset": "cuda-release-fused-cursor"
+      "name": "cuda-release-fused-no-cursor",
+      "configurePreset": "cuda-release-fused-no-cursor"
     }
   ],
   "testPresets": [
@@ -120,8 +123,8 @@
       }
     },
     {
-      "name": "cuda-release-fused-cursor",
-      "configurePreset": "cuda-release-fused-cursor",
+      "name": "cuda-release-fused-no-cursor",
+      "configurePreset": "cuda-release-fused-no-cursor",
       "output": {
         "outputOnFailure": true
       }

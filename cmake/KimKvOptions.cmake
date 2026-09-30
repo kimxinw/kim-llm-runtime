@@ -34,10 +34,18 @@ option(
     OFF
 )
 
+# Cursor 默认跟随 Fusion：首次配置时 Fusion ON 则默认 ON。已有构建目录切换
+# Fusion 后不会自动改写该缓存值，预设中显式指定两者。
+if(KIM_KV_ENABLE_FUSED_ATTENTION)
+    set(kim_kv_descriptor_cursor_default ON)
+else()
+    set(kim_kv_descriptor_cursor_default OFF)
+endif()
+
 option(
     KIM_KV_ENABLE_DESCRIPTOR_CURSOR
     "Reuse the current descriptor and page while fused attention walks tokens"
-    OFF
+    ${kim_kv_descriptor_cursor_default}
 )
 
 if(

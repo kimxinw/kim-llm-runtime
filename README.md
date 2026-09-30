@@ -33,6 +33,7 @@ flowchart LR
 - 完整 TinyLlama FP16 Decoder、LM Head 和 Greedy Argmax
 - 基于 cuBLAS 的动态 Token-Batched GEMM，支持 Batched Decode 与 Multi-token Prefill
 - 多 Token KV Write 可跨 Page/COW Tail，Paged Prefill Attention 对 Chunk 内 Query 应用因果 Mask
+- Fused Paged Attention 默认启用 Descriptor Cursor：每个 Warp 只定位一次起始页，页内复用 Descriptor 与 Page 指针，跨页时顺序推进
 - 预分配执行 Workspace，权重 Manifest 校验 Shape、Offset 与 SHA-256
 
 ### 3. Iteration Scheduler
@@ -82,11 +83,13 @@ ctest --preset cuda-release
 # Reference/Fused Compute Sanitizer 矩阵
 scripts/run_compute_sanitizer_matrix.sh
 
-# Fused+Descriptor Cursor 构建与 Sanitizer（结果目录置于仓库外以保持工作区干净）
-CUDACXX=/path/to/nvcc cmake --preset cuda-release-fused-cursor
-cmake --build --preset cuda-release-fused-cursor --parallel
-ctest --preset cuda-release-fused-cursor
-KIM_KV_SANITIZER_VARIANTS=fused-cursor KIM_KV_RESULTS_ROOT=/path/outside/repo \
+# Fused（默认含 Descriptor Cursor）；关闭 Cursor 的 A/B 基线预设为 cuda-release-fused-no-cursor
+CUDACXX=/path/to/nvcc cmake --preset cuda-release-fused
+cmake --build --preset cuda-release-fused --parallel
+ctest --preset cuda-release-fused
+
+# 指定变体的 Sanitizer（reference / fused / fused-no-cursor；结果目录置于仓库外以保持工作区干净）
+KIM_KV_SANITIZER_VARIANTS=fused KIM_KV_RESULTS_ROOT=/path/outside/repo \
   scripts/run_compute_sanitizer_matrix.sh
 ```
 
@@ -112,8 +115,12 @@ scripts/run_e5_end_to_end.sh
 # Reference/Fused × 五种分页策略的正式 E2E A/B 矩阵
 scripts/run_fusion_e5_matrix.sh
 
-# Fused/Fused+Cursor × 五种分页策略的正式 E2E A/B 矩阵
-KIM_KV_FUSION_E5_IMPLEMENTATIONS="fused fused-cursor" scripts/run_fusion_e5_matrix.sh
+# 关闭/开启 Descriptor Cursor × 五种分页策略的正式 E2E A/B 矩阵
+KIM_KV_FUSION_E5_IMPLEMENTATIONS="fused-no-cursor fused" scripts/run_fusion_e5_matrix.sh
+
+# 同上，改用 512/1024-token 长上下文套件（不含故障/容量 Case）
+KIM_KV_E5_SUITE=long KIM_KV_FUSION_E5_IMPLEMENTATIONS="fused-no-cursor fused" \
+  scripts/run_fusion_e5_matrix.sh
 ```
 
 ## 当前边界
@@ -122,5 +129,5 @@ KIM_KV_FUSION_E5_IMPLEMENTATIONS="fused fused-cursor" scripts/run_fusion_e5_matr
 - Ragged Batched Decode Attention 与 Multi-token Causal Prefill Attention 已实现
 - 单 Token 多请求继续使用 Batch KV/Attention Kernel；包含多 Token Chunk 的混合 Batch 当前按请求提交 KV/Attention Kernel
 - Reference 路径的 Prefill Attention Scores 与 Softmax/Value Output 仍为两个 Kernel；Fused 路径在 head dimension ≤128 时使用在线 Softmax 单 Kernel，>128 回退 Reference；两条路径仍保留 Score Workspace 接口
-- Descriptor Cursor 为独立编译开关 `KIM_KV_ENABLE_DESCRIPTOR_CURSOR`（默认 OFF，要求 Fusion ON），仅由 `cuda-release-fused-cursor` 预设启用
+- Descriptor Cursor 由 `KIM_KV_ENABLE_DESCRIPTOR_CURSOR` 控制：首次配置时跟随 Fusion 默认开启，要求 Fusion ON；`cuda-release-fused` 开启，`cuda-release-fused-no-cursor` 关闭作为 A/B 基线
 - 自动 Promotion 当前在 Token Commit 边界同步执行；失败后不做后台重试

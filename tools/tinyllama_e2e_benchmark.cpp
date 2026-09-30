@@ -41,12 +41,20 @@ enum class Variant : std::uint8_t {
     Fixed64,
 };
 
+// Standard 为 E5 正式矩阵的 9 类 Case；Long 为 512/1024-token 长上下文 Case，
+// 不含故障注入与容量探测。
+enum class CaseSuite : std::uint8_t {
+    Standard,
+    Long,
+};
+
 struct Options final {
     std::string manifest{};
     std::string weights{};
     std::string output{};
     std::string git_commit{"unknown"};
     Variant variant{Variant::Heterogeneous};
+    CaseSuite case_suite{CaseSuite::Standard};
     std::optional<std::string> case_name{};
     bool profile{false};
     std::uint32_t warmup{1};
@@ -371,6 +379,14 @@ private:
                 return false;
             }
             options.variant = *parsed;
+        } else if (key == "--suite") {
+            if (value == "standard") {
+                options.case_suite = CaseSuite::Standard;
+            } else if (value == "long") {
+                options.case_suite = CaseSuite::Long;
+            } else {
+                return false;
+            }
         } else if (key == "--case") {
             if (value.empty()) {
                 return false;
@@ -452,8 +468,36 @@ private:
     return result;
 }
 
-[[nodiscard]] std::vector<CaseSpec> performanceCases()
+[[nodiscard]] char const* caseSuiteName(CaseSuite suite) noexcept
 {
+    return suite == CaseSuite::Long ? "long" : "standard";
+}
+
+[[nodiscard]] std::vector<CaseSpec> longContextCases()
+{
+    std::vector<CaseSpec> result;
+    result.push_back(CaseSpec{
+        "long_prompt512_c4", 4, std::vector<std::uint32_t>(4, 512), 32,
+        false, false,
+    });
+    result.push_back(CaseSpec{
+        "long_prompt1024_c1", 1, {1024}, 32, false, false,
+    });
+    result.push_back(CaseSpec{
+        "long_prompt1024_c4", 4, std::vector<std::uint32_t>(4, 1024), 32,
+        false, false,
+    });
+    result.push_back(CaseSpec{
+        "long_mixed1024_c4", 4, {32, 1024, 32, 1024}, 32, false, false,
+    });
+    return result;
+}
+
+[[nodiscard]] std::vector<CaseSpec> performanceCases(CaseSuite suite)
+{
+    if (suite == CaseSuite::Long) {
+        return longContextCases();
+    }
     std::vector<CaseSpec> result;
     for (std::uint32_t concurrency : {1U, 2U, 4U}) {
         result.push_back(CaseSpec{
@@ -496,16 +540,17 @@ private:
 }
 
 [[nodiscard]] CaseSelection selectCases(
+    CaseSuite suite,
     std::optional<std::string> const& selected_case)
 {
     CaseSelection result;
-    for (CaseSpec& spec : performanceCases()) {
+    for (CaseSpec& spec : performanceCases(suite)) {
         if (!selected_case.has_value() || spec.name == *selected_case) {
             result.performance.push_back(std::move(spec));
         }
     }
-    result.capacity = !selected_case.has_value()
-        || *selected_case == "capacity";
+    result.capacity = suite == CaseSuite::Standard
+        && (!selected_case.has_value() || *selected_case == "capacity");
     return result;
 }
 
@@ -1084,6 +1129,7 @@ int main(int argc, char** argv)
             "hetero|fixed_8|fixed_16|fixed_32|fixed_64 --output PATH "
             "[--warmup N] --iterations N>=3 [--git-commit SHA] "
             "[--kv-capacity-tokens N] [--capacity-probe-tokens N] "
+            "[--suite standard|long] "
             "[--case NAME] [--profile (allows iterations>=1 and "
             "requires --case)]");
     }
@@ -1092,7 +1138,9 @@ int main(int argc, char** argv)
         return fail("--profile requires an NVTX-enabled build");
     }
 #endif
-    CaseSelection const selection = selectCases(options.case_name);
+    CaseSelection const selection = selectCases(
+        options.case_suite, options.case_name
+    );
     if (selection.empty()) {
         return fail("unknown case: " + *options.case_name);
     }
@@ -1196,6 +1244,7 @@ int main(int argc, char** argv)
         << "},\n  \"config\":{\"warmup\":" << options.warmup
         << ",\"iterations\":" << options.iterations
         << ",\"profile\":" << (options.profile ? "true" : "false")
+        << ",\"case_suite\":\"" << caseSuiteName(options.case_suite) << "\""
         << ",\"selected_case\":\""
         << (options.case_name.has_value() ? *options.case_name : "all")
         << "\""

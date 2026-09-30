@@ -34,6 +34,7 @@ if [[ -z "${cuda_compiler}" ]]; then
     for cache_path in \
         build-k5-cuda-reference/CMakeCache.txt \
         build-k5-cuda-fused/CMakeCache.txt \
+        build-k5-cuda-fused-no-cursor/CMakeCache.txt \
         build-k5-cuda-release/CMakeCache.txt; do
         if [[ -f "${cache_path}" ]]; then
             cuda_compiler="$(
@@ -77,8 +78,8 @@ build_directory_for_variant()
         fused)
             echo "build-k5-cuda-fused"
             ;;
-        fused-cursor)
-            echo "build-k5-cuda-fused-cursor"
+        fused-no-cursor)
+            echo "build-k5-cuda-fused-no-cursor"
             ;;
         *)
             echo "error: unsupported sanitizer variant: ${variant}" >&2
@@ -154,10 +155,10 @@ for variant in "${variants[@]}"; do
             ;;
         fused)
             expected_fusion="ON"
-            ;;
-        fused-cursor)
-            expected_fusion="ON"
             expected_cursor="ON"
+            ;;
+        fused-no-cursor)
+            expected_fusion="ON"
             ;;
     esac
     if ! grep -Fq \
@@ -223,11 +224,7 @@ fi
 
 {
     echo "schema_version=1"
-    if [[ " ${variants[*]} " == *" fused-cursor "* ]]; then
-        echo "stage=descriptor_cursor_compute_sanitizer"
-    else
-        echo "stage=reference_fused_compute_sanitizer"
-    fi
+    echo "stage=$(IFS=_; tr '-' '_' <<< "${variants[*]}")_compute_sanitizer"
     echo "source_commit=${source_commit}"
     echo "timestamp_utc=${timestamp_utc}"
     echo "working_tree_clean=${working_tree_clean}"

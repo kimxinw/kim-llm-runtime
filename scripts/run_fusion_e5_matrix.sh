@@ -21,7 +21,7 @@ if [[ "${#implementations[@]}" -ne 2 ]] \
 fi
 for implementation in "${implementations[@]}"; do
     case "${implementation}" in
-        reference|fused|fused-cursor)
+        reference|fused|fused-no-cursor)
             ;;
         *)
             echo "error: unsupported implementation: ${implementation}" >&2
@@ -29,7 +29,22 @@ for implementation in "${implementations[@]}"; do
             ;;
     esac
 done
-readonly stage="$(tr '-' '_' <<< "${implementations[0]}_${implementations[1]}")_e5"
+# standard 为 E5 九类 Case；long 为 512/1024-token 长上下文 Case。
+readonly suite="${KIM_KV_E5_SUITE:-standard}"
+case "${suite}" in
+    standard|long)
+        ;;
+    *)
+        echo "error: unsupported KIM_KV_E5_SUITE: ${suite}" >&2
+        exit 2
+        ;;
+esac
+readonly implementation_stage="$(tr '-' '_' <<< "${implementations[0]}_${implementations[1]}")"
+if [[ "${suite}" == long ]]; then
+    readonly stage="${implementation_stage}_long_e5"
+else
+    readonly stage="${implementation_stage}_e5"
+fi
 if [[ "${stage}" == reference_fused_e5 ]]; then
     readonly result_suffix="fusion_e5"
 else
@@ -74,7 +89,7 @@ if [[ -z "${cuda_compiler}" ]]; then
     for cache_path in \
         build-k5-cuda-reference/CMakeCache.txt \
         build-k5-cuda-fused/CMakeCache.txt \
-        build-k5-cuda-fused-cursor/CMakeCache.txt \
+        build-k5-cuda-fused-no-cursor/CMakeCache.txt \
         build-k5-cuda-release/CMakeCache.txt; do
         if [[ -f "${cache_path}" ]]; then
             cuda_compiler="$(
@@ -106,7 +121,7 @@ build_directory_for_implementation()
 
 expected_fusion_for_implementation()
 {
-    if [[ "$1" == fused ]] || [[ "$1" == fused-cursor ]]; then
+    if [[ "$1" == fused ]] || [[ "$1" == fused-no-cursor ]]; then
         echo ON
     else
         echo OFF
@@ -115,7 +130,7 @@ expected_fusion_for_implementation()
 
 expected_cursor_for_implementation()
 {
-    if [[ "$1" == fused-cursor ]]; then
+    if [[ "$1" == fused ]]; then
         echo ON
     else
         echo OFF
@@ -185,6 +200,7 @@ for implementation in "${implementations[@]}"; do
                 --iterations "${iterations}" \
                 --kv-capacity-tokens "${kv_capacity_tokens}" \
                 --capacity-probe-tokens "${capacity_probe_tokens}" \
+                --suite "${suite}" \
                 --git-commit "${source_commit}" \
                 >"${implementation_directory}/variants/${report_variant}.log" 2>&1
     done
@@ -201,9 +217,12 @@ CUDA_VISIBLE_DEVICES="${cuda_device}" \
 for implementation in "${implementations[@]}"; do
     cp "${result_directory}/reference_validation.json" \
         "${result_directory}/${implementation}/reference_validation.json"
-    python3 scripts/analyze_e5_results.py \
-        --result-dir "${result_directory}/${implementation}" \
-        >"${result_directory}/${implementation}/analysis.log"
+    # 单实现分页策略分析依赖 standard 套件的故障/容量 Case，long 套件只做跨实现分析。
+    if [[ "${suite}" == standard ]]; then
+        python3 scripts/analyze_e5_results.py \
+            --result-dir "${result_directory}/${implementation}" \
+            >"${result_directory}/${implementation}/analysis.log"
+    fi
 done
 
 python3 scripts/analyze_fusion_e5_results.py \
@@ -223,6 +242,7 @@ python3 scripts/analyze_fusion_e5_results.py \
     echo "iterations=${iterations}"
     echo "kv_capacity_tokens=${kv_capacity_tokens}"
     echo "capacity_probe_tokens=${capacity_probe_tokens}"
+    echo "suite=${suite}"
     echo "implementations=${implementations[*]}"
     echo "variants=${variants[*]}"
     echo "model_manifest=${manifest}"
@@ -250,8 +270,11 @@ python3 scripts/analyze_fusion_e5_results.py \
     done
 } >"${result_directory}/MANIFEST.txt"
 
-find "${result_directory}" -type f ! -name SHA256SUMS -print0 \
-    | LC_ALL=C sort -z \
-    | xargs -0 sha256sum >"${result_directory}/SHA256SUMS"
+(
+    cd "${result_directory}"
+    find . -type f ! -name SHA256SUMS -print0 \
+        | LC_ALL=C sort -z \
+        | xargs -0 sha256sum >SHA256SUMS
+)
 
 echo "Fusion E5 evidence: ${result_directory}"

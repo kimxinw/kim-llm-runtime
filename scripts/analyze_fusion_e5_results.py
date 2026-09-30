@@ -13,12 +13,16 @@ from typing import Any
 IMPLEMENTATION_LABELS = {
     "reference": "Reference",
     "fused": "Fused",
-    "fused-cursor": "Fused+Cursor",
+    "fused-no-cursor": "Fused (No Cursor)",
 }
 IMPLEMENTATION_SWITCHES = {
-    "reference": "Fusion OFF",
-    "fused": "Fusion ON / Cursor OFF",
-    "fused-cursor": "Fusion ON / Cursor ON",
+    "reference": "Fusion OFF / Cursor OFF",
+    "fused": "Fusion ON / Cursor ON",
+    "fused-no-cursor": "Fusion ON / Cursor OFF",
+}
+SUITE_LABELS = {
+    "standard": "standard 套件",
+    "long": "long 长上下文套件",
 }
 VARIANTS = ("fixed_8", "fixed_16", "fixed_32", "fixed_64", "hetero_8_64")
 NON_PERFORMANCE_CASES = {"fault_c4", "capacity"}
@@ -88,6 +92,21 @@ def outcome_signature(case: dict[str, Any]) -> list[dict[str, Any]]:
         }
         for run in case["runs"]
     ]
+
+
+def case_suite(reports: dict[str, dict[str, dict[str, Any]]]) -> str:
+    # 早于 case_suite 字段的报告均为 standard 套件。
+    suites = {
+        report["config"].get("case_suite", "standard")
+        for implementation_reports in reports.values()
+        for report in implementation_reports.values()
+    }
+    if len(suites) != 1:
+        raise RuntimeError(f"case suite mismatch: {sorted(suites)}")
+    suite = next(iter(suites))
+    if suite not in SUITE_LABELS:
+        raise RuntimeError(f"unsupported case suite: {suite}")
+    return suite
 
 
 def percent_delta(value: float, baseline: float) -> float:
@@ -235,11 +254,21 @@ def write_report(
     comparisons: list[dict[str, Any]],
     baseline: str,
     candidate: str,
+    suite: str,
 ) -> None:
     base = column_prefix(baseline)
     cand = column_prefix(candidate)
     base_label = IMPLEMENTATION_LABELS[baseline]
     cand_label = IMPLEMENTATION_LABELS[candidate]
+    case_types = (
+        validation["token_cases"] + validation["outcome_cases"]
+    ) // len(VARIANTS)
+    if validation["outcome_cases"]:
+        outcome_row = (
+            f"| 故障与容量结果一致 | PASS（{validation['outcome_cases']} 个策略/Case） |"
+        )
+    else:
+        outcome_row = "| 故障与容量结果一致 | 不适用（该套件不含故障注入与容量 Case） |"
     lines = [
         f"# {base_label}/{cand_label} TinyLlama E5 正式矩阵",
         "",
@@ -251,7 +280,7 @@ def write_report(
         "| 配置、模型与 Storage Budget 一致 | PASS |",
         "| Case 集合一致 | PASS |",
         f"| 跨实现 Token 一致 | PASS（{validation['token_cases']} 个策略/Case） |",
-        f"| 故障与容量结果一致 | PASS（{validation['outcome_cases']} 个策略/Case） |",
+        outcome_row,
         f"| Transformers FP16 Reference | PASS（{validation['transformers_reference_prompts']} 个唯一 Prompt） |",
         f"| 测量 Run 总数 | {validation['measurement_runs']} |",
         "",
@@ -276,7 +305,7 @@ def write_report(
             "## 结论边界",
             "",
             f"- {base_label}（{IMPLEMENTATION_SWITCHES[baseline]}）与 {cand_label}（{IMPLEMENTATION_SWITCHES[candidate]}）仅编译开关不同；模型、请求、分页策略、容量、Warmup、迭代数和计时边界保持一致。",
-            "- 每个实现包含五种分页策略和九类 Case；性能比较排除故障注入与容量 Case。",
+            f"- 每个实现包含五种分页策略和 {case_types} 类 Case（{SUITE_LABELS[suite]}）；性能比较排除故障注入与容量 Case。",
             "- 本结果仅适用于记录的 TinyLlama FP16、RTX 3060 和当前 CUDA/Driver 环境，不能外推到其他模型或硬件。",
             "- 实现间收益与 Heterogeneous/Fixed Page 策略收益分别统计，不能相互替代。",
             "",
@@ -304,6 +333,7 @@ def main() -> None:
     args = parse_args()
     implementations = (args.baseline, args.candidate)
     reports = load_reports(args.result_dir, implementations)
+    suite = case_suite(reports)
     validation = validate(
         args.result_dir, reports, args.baseline, args.candidate
     )
@@ -320,7 +350,12 @@ def main() -> None:
         encoding="utf-8",
     )
     write_report(
-        args.result_dir, validation, comparisons, args.baseline, args.candidate
+        args.result_dir,
+        validation,
+        comparisons,
+        args.baseline,
+        args.candidate,
+        suite,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
