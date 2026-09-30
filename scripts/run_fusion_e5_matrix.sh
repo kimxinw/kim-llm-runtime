@@ -12,8 +12,31 @@ cd "${project_root}"
 readonly source_commit="$(git rev-parse --verify HEAD)"
 readonly short_commit="${source_commit:0:12}"
 readonly timestamp_utc="$(date -u +%Y%m%dT%H%M%SZ)"
+read -r -a implementations <<< "${KIM_KV_FUSION_E5_IMPLEMENTATIONS:-reference fused}"
+readonly implementations
+if [[ "${#implementations[@]}" -ne 2 ]] \
+    || [[ "${implementations[0]}" == "${implementations[1]}" ]]; then
+    echo "error: KIM_KV_FUSION_E5_IMPLEMENTATIONS needs two distinct implementations" >&2
+    exit 2
+fi
+for implementation in "${implementations[@]}"; do
+    case "${implementation}" in
+        reference|fused|fused-cursor)
+            ;;
+        *)
+            echo "error: unsupported implementation: ${implementation}" >&2
+            exit 2
+            ;;
+    esac
+done
+readonly stage="$(tr '-' '_' <<< "${implementations[0]}_${implementations[1]}")_e5"
+if [[ "${stage}" == reference_fused_e5 ]]; then
+    readonly result_suffix="fusion_e5"
+else
+    readonly result_suffix="${stage}"
+fi
 readonly results_root="${KIM_KV_RESULTS_ROOT:-${project_root}/benchmarks/results}"
-readonly result_directory="${KIM_KV_FUSION_E5_RESULT_DIR:-${results_root}/${short_commit}_${timestamp_utc}_fusion_e5}"
+readonly result_directory="${KIM_KV_FUSION_E5_RESULT_DIR:-${results_root}/${short_commit}_${timestamp_utc}_${result_suffix}}"
 readonly manifest="${KIM_KV_MODEL_MANIFEST:-/home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.manifest}"
 readonly weights="${KIM_KV_MODEL_WEIGHTS:-/home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.weights}"
 readonly reference_python="${KIM_KV_REFERENCE_PYTHON:-/home/xinwang/miniconda3/envs/vllm/bin/python}"
@@ -23,7 +46,6 @@ readonly kv_capacity_tokens="${KIM_KV_E5_KV_CAPACITY_TOKENS:-8192}"
 readonly capacity_probe_tokens="${KIM_KV_E5_CAPACITY_PROBE_TOKENS:-512}"
 readonly build_jobs="${KIM_KV_BUILD_JOBS:-4}"
 readonly cuda_device="${KIM_KV_CUDA_DEVICE:-0}"
-readonly -a implementations=(reference fused)
 readonly -a variants=(fixed_8 fixed_16 fixed_32 fixed_64 hetero)
 
 if [[ ! -f "${manifest}" ]] || [[ ! -f "${weights}" ]]; then
@@ -52,6 +74,7 @@ if [[ -z "${cuda_compiler}" ]]; then
     for cache_path in \
         build-k5-cuda-reference/CMakeCache.txt \
         build-k5-cuda-fused/CMakeCache.txt \
+        build-k5-cuda-fused-cursor/CMakeCache.txt \
         build-k5-cuda-release/CMakeCache.txt; do
         if [[ -f "${cache_path}" ]]; then
             cuda_compiler="$(
@@ -83,7 +106,16 @@ build_directory_for_implementation()
 
 expected_fusion_for_implementation()
 {
-    if [[ "$1" == fused ]]; then
+    if [[ "$1" == fused ]] || [[ "$1" == fused-cursor ]]; then
+        echo ON
+    else
+        echo OFF
+    fi
+}
+
+expected_cursor_for_implementation()
+{
+    if [[ "$1" == fused-cursor ]]; then
         echo ON
     else
         echo OFF
@@ -110,6 +142,7 @@ for implementation in "${implementations[@]}"; do
     preset="$(preset_for_implementation "${implementation}")"
     build_directory="$(build_directory_for_implementation "${implementation}")"
     expected_fusion="$(expected_fusion_for_implementation "${implementation}")"
+    expected_cursor="$(expected_cursor_for_implementation "${implementation}")"
 
     echo "Configuring, building, and testing ${preset}"
     cmake --preset "${preset}" \
@@ -122,6 +155,12 @@ for implementation in "${implementations[@]}"; do
         "KIM_KV_ENABLE_FUSED_ATTENTION:BOOL=${expected_fusion}" \
         "${build_directory}/CMakeCache.txt"; then
         echo "error: ${implementation} does not have Fusion=${expected_fusion}" >&2
+        exit 2
+    fi
+    if ! grep -Fq \
+        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR:BOOL=${expected_cursor}" \
+        "${build_directory}/CMakeCache.txt"; then
+        echo "error: ${implementation} does not have Cursor=${expected_cursor}" >&2
         exit 2
     fi
 
@@ -155,7 +194,7 @@ CUDA_VISIBLE_DEVICES="${cuda_device}" \
     "${reference_python}" scripts/validate_e5_reference.py \
         --manifest "${manifest}" \
         --weights "${weights}" \
-        --runtime-json "${result_directory}/reference/variants/fixed_8.json" \
+        --runtime-json "${result_directory}/${implementations[0]}/variants/fixed_8.json" \
         --output "${result_directory}/reference_validation.json" \
         >"${result_directory}/reference_validation.log"
 
@@ -169,11 +208,13 @@ done
 
 python3 scripts/analyze_fusion_e5_results.py \
     --result-dir "${result_directory}" \
+    --baseline "${implementations[0]}" \
+    --candidate "${implementations[1]}" \
     >"${result_directory}/analysis.log"
 
 {
     echo "schema_version=1"
-    echo "stage=reference_fused_e5"
+    echo "stage=${stage}"
     echo "source_commit=${source_commit}"
     echo "working_tree_clean=true"
     echo "timestamp_utc=${timestamp_utc}"
