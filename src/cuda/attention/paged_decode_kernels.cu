@@ -292,6 +292,94 @@ __device__ ::kimkvcache::DeviceBlockDescriptor findDescriptor(
     return {};
 }
 
+#if defined(KIM_KV_ENABLE_DESCRIPTOR_CURSOR)
+// Block descriptors are ordered by logical token. Fused attention also visits
+// each warp's token range monotonically, so retain the current page and advance
+// only when the token crosses its logical end.
+struct DescriptorCursor {
+    std::uint32_t descriptor_index{};
+    ::kimkvcache::DeviceBlockDescriptor descriptor{};
+    KvScalar const* page{};
+    std::uint32_t logical_token_end{};
+};
+
+__device__ void loadDescriptorCursor(
+    DescriptorCursor& cursor,
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_index,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements)
+{
+    cursor.descriptor_index = descriptor_index;
+    cursor.descriptor = descriptors[descriptor_index];
+    cursor.page = descriptorPage(
+        cursor.descriptor,
+        micro_pool,
+        micro_page_elements,
+        extent_pool,
+        extent_page_elements
+    );
+    cursor.logical_token_end = cursor.descriptor.logical_token_begin
+        + cursor.descriptor.valid_tokens;
+}
+
+__device__ DescriptorCursor makeDescriptorCursor(
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    std::uint32_t token,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements)
+{
+    DescriptorCursor cursor{};
+    for (std::uint32_t index = 0; index < descriptor_count; ++index) {
+        auto const descriptor = descriptors[index];
+        if (token >= descriptor.logical_token_begin
+            && token < descriptor.logical_token_begin
+                + descriptor.valid_tokens) {
+            loadDescriptorCursor(
+                cursor,
+                descriptors,
+                index,
+                micro_pool,
+                micro_page_elements,
+                extent_pool,
+                extent_page_elements
+            );
+            break;
+        }
+    }
+    return cursor;
+}
+
+__device__ void advanceDescriptorCursor(
+    DescriptorCursor& cursor,
+    ::kimkvcache::DeviceBlockDescriptor const* descriptors,
+    std::uint32_t descriptor_count,
+    std::uint32_t token,
+    KvScalar const* micro_pool,
+    std::size_t micro_page_elements,
+    KvScalar const* extent_pool,
+    std::size_t extent_page_elements)
+{
+    while (token >= cursor.logical_token_end
+        && cursor.descriptor_index + 1 < descriptor_count) {
+        loadDescriptorCursor(
+            cursor,
+            descriptors,
+            cursor.descriptor_index + 1,
+            micro_pool,
+            micro_page_elements,
+            extent_pool,
+            extent_page_elements
+        );
+    }
+}
+#endif
+
 __global__ void pagedAttentionScoresKernel(
     ::kimkvcache::DeviceBlockDescriptor const* descriptors,
     std::uint32_t descriptor_count,
@@ -854,11 +942,31 @@ __device__ void fusedPagedAttention(
     unsigned int const range = (visible_tokens + kFusedWarps - 1) / kFusedWarps;
     unsigned int const begin = warp * range;
     unsigned int const end = min(begin + range, visible_tokens);
+#if defined(KIM_KV_ENABLE_DESCRIPTOR_CURSOR)
+    DescriptorCursor cursor{};
+    if (begin < end) {
+        cursor = makeDescriptorCursor(
+            descriptors, descriptor_count, begin,
+            micro_pool, micro_page_elements,
+            extent_pool, extent_page_elements
+        );
+    }
+#endif
     for (unsigned int token = begin; token < end; ++token) {
+#if defined(KIM_KV_ENABLE_DESCRIPTOR_CURSOR)
+        advanceDescriptorCursor(
+            cursor, descriptors, descriptor_count, token,
+            micro_pool, micro_page_elements,
+            extent_pool, extent_page_elements
+        );
+        auto const descriptor = cursor.descriptor;
+        KvScalar const* const page = cursor.page;
+#else
         auto const descriptor = findDescriptor(descriptors, descriptor_count, token);
         KvScalar const* const page = descriptorPage(
             descriptor, micro_pool, micro_page_elements,
             extent_pool, extent_page_elements);
+#endif
         unsigned int const page_token = token - descriptor.logical_token_begin;
         float dot = 0.0F;
         for (unsigned int i = 0; i < kFusedMaxDimensions / 32; ++i) {

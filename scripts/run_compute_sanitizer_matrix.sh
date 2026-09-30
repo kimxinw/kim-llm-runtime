@@ -77,6 +77,9 @@ build_directory_for_variant()
         fused)
             echo "build-k5-cuda-fused"
             ;;
+        fused-cursor)
+            echo "build-k5-cuda-fused-cursor"
+            ;;
         *)
             echo "error: unsupported sanitizer variant: ${variant}" >&2
             return 2
@@ -145,13 +148,28 @@ fi
 for variant in "${variants[@]}"; do
     build_directory="$(build_directory_for_variant "${variant}")"
     expected_fusion="OFF"
-    if [[ "${variant}" == fused ]]; then
-        expected_fusion="ON"
-    fi
+    expected_cursor="OFF"
+    case "${variant}" in
+        reference)
+            ;;
+        fused)
+            expected_fusion="ON"
+            ;;
+        fused-cursor)
+            expected_fusion="ON"
+            expected_cursor="ON"
+            ;;
+    esac
     if ! grep -Fq \
         "KIM_KV_ENABLE_FUSED_ATTENTION:BOOL=${expected_fusion}" \
         "${build_directory}/CMakeCache.txt"; then
         echo "error: ${variant} build does not have Fusion=${expected_fusion}" >&2
+        exit 2
+    fi
+    if ! grep -Fq \
+        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR:BOOL=${expected_cursor}" \
+        "${build_directory}/CMakeCache.txt"; then
+        echo "error: ${variant} build does not have Cursor=${expected_cursor}" >&2
         exit 2
     fi
 
@@ -205,7 +223,11 @@ fi
 
 {
     echo "schema_version=1"
-    echo "stage=reference_fused_compute_sanitizer"
+    if [[ " ${variants[*]} " == *" fused-cursor "* ]]; then
+        echo "stage=descriptor_cursor_compute_sanitizer"
+    else
+        echo "stage=reference_fused_compute_sanitizer"
+    fi
     echo "source_commit=${source_commit}"
     echo "timestamp_utc=${timestamp_utc}"
     echo "working_tree_clean=${working_tree_clean}"

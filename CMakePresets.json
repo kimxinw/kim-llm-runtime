@@ -56,6 +56,16 @@
       "cacheVariables": {
         "KIM_KV_ENABLE_FUSED_ATTENTION": "ON"
       }
+    },
+    {
+      "name": "cuda-release-fused-cursor",
+      "displayName": "CUDA Release Fused + Descriptor Cursor (SM 86)",
+      "description": "Fused paged attention with page-wise descriptor traversal",
+      "inherits": "cuda-release-fused",
+      "binaryDir": "${sourceDir}/build-k5-cuda-fused-cursor",
+      "cacheVariables": {
+        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -74,6 +84,10 @@
     {
       "name": "cuda-release-fused",
       "configurePreset": "cuda-release-fused"
+    },
+    {
+      "name": "cuda-release-fused-cursor",
+      "configurePreset": "cuda-release-fused-cursor"
     }
   ],
   "testPresets": [
@@ -101,6 +115,13 @@
     {
       "name": "cuda-release-fused",
       "configurePreset": "cuda-release-fused",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "cuda-release-fused-cursor",
+      "configurePreset": "cuda-release-fused-cursor",
       "output": {
         "outputOnFailure": true
       }

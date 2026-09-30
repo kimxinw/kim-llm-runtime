@@ -39,6 +39,10 @@ if(KIM_KV_ENABLE_FUSED_ATTENTION)
     target_compile_definitions(kim_kv_cuda PRIVATE KIM_KV_ENABLE_FUSED_ATTENTION=1)
 endif()
 
+if(KIM_KV_ENABLE_DESCRIPTOR_CURSOR)
+    target_compile_definitions(kim_kv_cuda PRIVATE KIM_KV_ENABLE_DESCRIPTOR_CURSOR=1)
+endif()
+
 target_link_libraries(
     kim_kv_cuda
     PRIVATE

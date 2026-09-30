@@ -34,6 +34,23 @@ option(
     OFF
 )
 
+option(
+    KIM_KV_ENABLE_DESCRIPTOR_CURSOR
+    "Reuse the current descriptor and page while fused attention walks tokens"
+    OFF
+)
+
+if(
+    KIM_KV_ENABLE_DESCRIPTOR_CURSOR
+    AND
+    NOT KIM_KV_ENABLE_FUSED_ATTENTION
+)
+    message(
+        FATAL_ERROR
+        "KIM_KV_ENABLE_DESCRIPTOR_CURSOR requires KIM_KV_ENABLE_FUSED_ATTENTION"
+    )
+endif()
+
 if(
     KIM_KV_ENABLE_TSAN
     AND
