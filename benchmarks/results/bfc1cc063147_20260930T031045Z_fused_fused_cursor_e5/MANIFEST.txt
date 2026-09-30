@@ -1,0 +1,21 @@
+schema_version=1
+stage=fused_fused_cursor_e5
+source_commit=bfc1cc063147b375b8b3b6a3ba309760b28b402b
+working_tree_clean=true
+timestamp_utc=20260930T031045Z
+gpu_device=0
+warmup=1
+iterations=3
+kv_capacity_tokens=8192
+capacity_probe_tokens=512
+implementations=fused fused-cursor
+variants=fixed_8 fixed_16 fixed_32 fixed_64 hetero
+model_manifest=/home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.manifest
+model_weights=/home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.weights
+cuda_root=/home/xinwang/miniconda3/envs/trt
+cuda_compiler=/home/xinwang/miniconda3/envs/trt/bin/nvcc
+gpu=NVIDIA GeForce RTX 3060, 616.56, 12288 MiB, 8.6
+e8076bba8e05b6dcbd8e7a8a474a522e69d16958a93e6da30133a947622f9ba1  /home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.manifest
+5a25040a72885d3dbf246f6819b09da797eedf2ebee830b3ac98791d4efbeb99  /home/xinwang/workspaces/kim-kvcache-e2-model/tinyllama-1.1b-chat-fp16.weights
+77cdb0783e9419cdbc2eef99e73c026ab61858ccd421e10b293c9c14f5edee1e  build-k5-cuda-fused/tools/kim_kv_tinyllama_e2e_benchmark
+be1b8e320c650bd28b747ca324b215ce1c14ad34edb5548ae78904f2c4f1f8f8  build-k5-cuda-fused-cursor/tools/kim_kv_tinyllama_e2e_benchmark

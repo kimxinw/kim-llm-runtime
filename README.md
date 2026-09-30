@@ -47,9 +47,9 @@ flowchart LR
 
 | 项目 | 结果 |
 |---|---:|
-| CPU / CUDA Release | `13/13 PASS` / Reference、Fused 各 `21/21 PASS` |
+| CPU / CUDA Release | `13/13 PASS` / Reference、Fused、Fused+Cursor 各 `21/21 PASS` |
 | CPU ASan/UBSan | `13/13 PASS` |
-| CUDA Sanitizer | Reference/Fused × 4 个 CUDA 合同 × 3 个工具，`24/24 PASS`；memcheck/initcheck `0 errors`，racecheck `0 errors/0 warnings` |
+| CUDA Sanitizer | Reference/Fused × 4 个 CUDA 合同 × 3 个工具，`24/24 PASS`；Fused+Cursor `12/12 PASS`；memcheck/initcheck `0 errors`，racecheck `0 errors/0 warnings` |
 | 模型正确性 | Hidden、Logits、Top-10 通过数值门禁 |
 | 端到端生成 | 8 个 Prompt 的完整 Token 与 Transformers FP16 一致 |
 | 正式性能矩阵 | 五策略 × 9 Case × 3 轮，`135/135` 个 Run 的预期结果与资源回收全部通过 |
@@ -57,10 +57,14 @@ flowchart LR
 | KV 收益 | Hetero 相对 Fixed-8 的 Long c1/c2/c4 E2E p50 降低 `17.13%/14.56%/11.85%`，Output tokens/s 提高 `20.73%/15.89%/13.42%` |
 | Fusion 收益 | Hetero 的 Short c1/c2/c4 E2E p50 降低 `12.54%/13.86%/18.96%`，Long c1/c2/c4 降低 `34.34%/41.21%/53.13%`，Mixed c4 降低 `44.68%` |
 | 容量边界 | Hetero 峰值碎片为 `0`，Capacity 完成数 `30`，高于 Fixed-64 的 `24`、低于 Fixed-8/16/32 的 `48` |
+| Descriptor Cursor 正式 A/B | Fused/Fused+Cursor × 五策略 × 9 Case × 3 轮，共 `270/270` 个 Run；配置、Token、故障/容量结果一致 |
+| Descriptor Cursor 收益 | Kernel 层（开发期 NCU）：1024-Token 8 请求 Batch 融合 Kernel `705.38 → 251.30 us`；E2E 层：p50 差值中位数 `-0.55%`，处于同代码跨次运行波动（中位 `5.31%`）内，无可分辨变化 |
 
 完整结果位于 `tests/reference` 和 `benchmarks/results`；分页策略正式 E5 证据为
 `benchmarks/results/66067cf69125_20260910T104436Z_e5`，Reference/Fused 正式 A/B 证据为
-`benchmarks/results/0dc98d1149b1_20260917T075135Z_fusion_e5`。
+`benchmarks/results/0dc98d1149b1_20260917T075135Z_fusion_e5`；Descriptor Cursor 正式 A/B 与
+Sanitizer 证据为 `benchmarks/results/bfc1cc063147_20260930T031045Z_fused_fused_cursor_e5` 与
+`benchmarks/results/bfc1cc063147_20260930T030301Z_compute_sanitizer`。
 
 ## 构建与测试
 
@@ -77,6 +81,13 @@ ctest --preset cuda-release
 
 # Reference/Fused Compute Sanitizer 矩阵
 scripts/run_compute_sanitizer_matrix.sh
+
+# Fused+Descriptor Cursor 构建与 Sanitizer（结果目录置于仓库外以保持工作区干净）
+CUDACXX=/path/to/nvcc cmake --preset cuda-release-fused-cursor
+cmake --build --preset cuda-release-fused-cursor --parallel
+ctest --preset cuda-release-fused-cursor
+KIM_KV_SANITIZER_VARIANTS=fused-cursor KIM_KV_RESULTS_ROOT=/path/outside/repo \
+  scripts/run_compute_sanitizer_matrix.sh
 ```
 
 ## 运行
@@ -100,6 +111,9 @@ scripts/run_e5_end_to_end.sh
 
 # Reference/Fused × 五种分页策略的正式 E2E A/B 矩阵
 scripts/run_fusion_e5_matrix.sh
+
+# Fused/Fused+Cursor × 五种分页策略的正式 E2E A/B 矩阵
+KIM_KV_FUSION_E5_IMPLEMENTATIONS="fused fused-cursor" scripts/run_fusion_e5_matrix.sh
 ```
 
 ## 当前边界
@@ -108,4 +122,5 @@ scripts/run_fusion_e5_matrix.sh
 - Ragged Batched Decode Attention 与 Multi-token Causal Prefill Attention 已实现
 - 单 Token 多请求继续使用 Batch KV/Attention Kernel；包含多 Token Chunk 的混合 Batch 当前按请求提交 KV/Attention Kernel
 - Reference 路径的 Prefill Attention Scores 与 Softmax/Value Output 仍为两个 Kernel；Fused 路径在 head dimension ≤128 时使用在线 Softmax 单 Kernel，>128 回退 Reference；两条路径仍保留 Score Workspace 接口
+- Descriptor Cursor 为独立编译开关 `KIM_KV_ENABLE_DESCRIPTOR_CURSOR`（默认 OFF，要求 Fusion ON），仅由 `cuda-release-fused-cursor` 预设启用
 - 自动 Promotion 当前在 Token Commit 边界同步执行；失败后不做后台重试

@@ -1,0 +1,60 @@
+{
+  "batched_attention_active": true,
+  "engine_promotion_active": true,
+  "fairness": {
+    "config_equal": true,
+    "cross_variant_tokens_equal": true,
+    "storage_budget_equal": true,
+    "token_cases": {
+      "decode_long_prompt_c1": true,
+      "decode_long_prompt_c2": true,
+      "decode_long_prompt_c4": true,
+      "decode_short_c1": true,
+      "decode_short_c2": true,
+      "decode_short_c4": true,
+      "mixed_c4": true
+    },
+    "transformers_reference_passed": true,
+    "transformers_reference_prompts": 8
+  },
+  "hetero_secondary_allocations": 18,
+  "hetero_vs_fixed_8": {
+    "decode_long_prompt_c1": {
+      "e2e_p50_delta_percent": 4.759682771275873,
+      "output_tokens_per_second_delta_percent": -3.4063971667826682,
+      "tpot_p50_delta_percent": 4.263805207245419
+    },
+    "decode_long_prompt_c2": {
+      "e2e_p50_delta_percent": 0.5214899132052783,
+      "output_tokens_per_second_delta_percent": 2.114415219468899,
+      "tpot_p50_delta_percent": -0.45901864630625694
+    },
+    "decode_long_prompt_c4": {
+      "e2e_p50_delta_percent": 0.3896157227648382,
+      "output_tokens_per_second_delta_percent": -0.5085648114024058,
+      "tpot_p50_delta_percent": 0.12556250230252197
+    },
+    "decode_short_c1": {
+      "e2e_p50_delta_percent": -0.9960322921223874,
+      "output_tokens_per_second_delta_percent": 0.8410238400644692,
+      "tpot_p50_delta_percent": -1.0047487645877704
+    },
+    "decode_short_c2": {
+      "e2e_p50_delta_percent": -1.6777429872148142,
+      "output_tokens_per_second_delta_percent": 1.7654046546727544,
+      "tpot_p50_delta_percent": -1.7315626814794993
+    },
+    "decode_short_c4": {
+      "e2e_p50_delta_percent": 0.05014799299582982,
+      "output_tokens_per_second_delta_percent": -0.004150350353100943,
+      "tpot_p50_delta_percent": -0.22232274210731012
+    },
+    "mixed_c4": {
+      "e2e_p50_delta_percent": -5.231562417217058,
+      "output_tokens_per_second_delta_percent": 5.80084417588743,
+      "tpot_p50_delta_percent": -5.126680072382975
+    }
+  },
+  "schema_version": 1,
+  "successful": true
+}

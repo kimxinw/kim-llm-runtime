@@ -108,3 +108,44 @@ rounds, the five page strategies, a Transformers FP16 reference, capacity and
 fault workloads, analysis, and checksums. A clean committed tree is required
 for a formal run. `KIM_KV_ALLOW_DIRTY=1` is development-only; such evidence
 must say `precommit_source_hash_pinned` and record exact changed-source hashes.
+
+Two-implementation E5 A/B matrices use `scripts/run_fusion_e5_matrix.sh`.
+`KIM_KV_FUSION_E5_IMPLEMENTATIONS` names the baseline and candidate
+(`reference fused` by default, or `fused fused-cursor`). The directory suffix is
+`fusion_e5` for the default pair and `<baseline>_<candidate>_e5` otherwise:
+
+```text
+benchmarks/results/<source-commit>_<UTC timestamp>_<suffix>/
+├── MANIFEST.txt
+├── SHA256SUMS
+├── REPORT.md
+├── comparison.json
+├── fusion_comparison.csv
+├── analysis.log
+├── reference_validation.{json,log}
+└── <baseline|candidate>/
+    ├── REPORT.md
+    ├── analysis.log
+    ├── comparison.json
+    ├── reference_validation.json
+    ├── summary.csv
+    └── variants/<fixed_8|fixed_16|fixed_32|fixed_64|hetero_8_64>.{json,log}
+```
+
+Both builds come from the same clean commit and differ only in their
+compile-time switches. A single matrix run has about 5% run-to-run E2E p50
+variation for identical code, so a smaller E2E delta is not a resolved effect.
+
+Compute Sanitizer evidence uses `scripts/run_compute_sanitizer_matrix.sh` and
+`KIM_KV_SANITIZER_VARIANTS` (`reference`, `fused`, `fused-cursor`). The script
+checks cleanliness after writing its output, so formal runs set
+`KIM_KV_RESULTS_ROOT` outside the worktree and copy the directory here
+afterwards; its `SHA256SUMS` uses relative paths:
+
+```text
+benchmarks/results/<source-commit>_<UTC timestamp>_compute_sanitizer/
+├── MANIFEST.txt
+├── SHA256SUMS
+├── summary.tsv
+└── logs/<variant>_<tool>_<test>.log
+```

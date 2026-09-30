@@ -1,0 +1,13 @@
+variant	tool	test	status	exit_code	duration_seconds	log
+fused-cursor	memcheck	paged_attention_fusion_test	PASS	0	2	logs/fused-cursor_memcheck_paged_attention_fusion_test.log
+fused-cursor	memcheck	cuda_kv_test	PASS	0	0	logs/fused-cursor_memcheck_cuda_kv_test.log
+fused-cursor	memcheck	cuda_engine_kv_backend_test	PASS	0	2	logs/fused-cursor_memcheck_cuda_engine_kv_backend_test.log
+fused-cursor	memcheck	cuda_model_runner_test	PASS	0	3	logs/fused-cursor_memcheck_cuda_model_runner_test.log
+fused-cursor	racecheck	paged_attention_fusion_test	PASS	0	4	logs/fused-cursor_racecheck_paged_attention_fusion_test.log
+fused-cursor	racecheck	cuda_kv_test	PASS	0	2	logs/fused-cursor_racecheck_cuda_kv_test.log
+fused-cursor	racecheck	cuda_engine_kv_backend_test	PASS	0	5	logs/fused-cursor_racecheck_cuda_engine_kv_backend_test.log
+fused-cursor	racecheck	cuda_model_runner_test	PASS	0	32	logs/fused-cursor_racecheck_cuda_model_runner_test.log
+fused-cursor	initcheck	paged_attention_fusion_test	PASS	0	1	logs/fused-cursor_initcheck_paged_attention_fusion_test.log
+fused-cursor	initcheck	cuda_kv_test	PASS	0	1	logs/fused-cursor_initcheck_cuda_kv_test.log
+fused-cursor	initcheck	cuda_engine_kv_backend_test	PASS	0	1	logs/fused-cursor_initcheck_cuda_engine_kv_backend_test.log
+fused-cursor	initcheck	cuda_model_runner_test	PASS	0	3	logs/fused-cursor_initcheck_cuda_model_runner_test.log

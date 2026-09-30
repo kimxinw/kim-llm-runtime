@@ -1,0 +1,20 @@
+========= COMPUTE-SANITIZER
+dim=8 queries=1 batch=1 tokens=1 max_error=0
+dim=8 queries=1 batch=4 tokens=65 max_error=6.07677e-05
+dim=8 queries=16 batch=1 tokens=129 max_error=7.38255e-06
+dim=33 queries=1 batch=1 tokens=1 max_error=0
+dim=33 queries=1 batch=4 tokens=65 max_error=0.000114231
+dim=33 queries=16 batch=1 tokens=129 max_error=7.63266e-06
+dim=64 queries=1 batch=1 tokens=1 max_error=0
+dim=64 queries=1 batch=4 tokens=65 max_error=0.000119171
+dim=64 queries=16 batch=1 tokens=129 max_error=1.51759e-05
+dim=128 queries=1 batch=1 tokens=1 max_error=0
+dim=128 queries=1 batch=4 tokens=65 max_error=0.000122088
+dim=128 queries=16 batch=1 tokens=129 max_error=1.52686e-05
+dim=192 queries=1 batch=1 tokens=1 max_error=0
+dim=192 queries=1 batch=4 tokens=65 max_error=0.000244121
+dim=192 queries=16 batch=1 tokens=129 max_error=6.10616e-05
+dim=64 queries=1 batch=8 tokens=1024 max_error=0.00012107
+dim=64 queries=8 batch=1 tokens=129 max_error=0.000361251
+Paged attention dense-reference contracts PASS
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
